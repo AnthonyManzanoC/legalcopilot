@@ -1,4 +1,5 @@
-FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+# 1. Usamos la versión basada en Ubuntu (Jammy) para compilar
+FROM mcr.microsoft.com/dotnet/sdk:8.0-jammy AS build
 WORKDIR /src
 COPY LegalPilot.sln ./
 COPY NuGet.Config ./
@@ -8,10 +9,19 @@ RUN dotnet restore src/LegalPilot.Api/LegalPilot.Api.csproj
 COPY . .
 RUN dotnet publish src/LegalPilot.Api/LegalPilot.Api.csproj -c Release -o /app/publish /p:UseAppHost=false
 
-FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
+# 2. Usamos Ubuntu (Jammy) para el entorno de ejecución (Evita el Segfault 139)
+FROM mcr.microsoft.com/dotnet/aspnet:8.0-jammy AS runtime
 WORKDIR /app
-ENV ASPNETCORE_URLS=http://+:8080
+
+# Puerto oficial actualizado para .NET 8
+ENV ASPNETCORE_HTTP_PORTS=8080
+
+# 3. Damos permisos explícitos a la carpeta App_Data para el usuario de .NET
+USER root
+RUN mkdir -p /app/App_Data && chown -R app:app /app/App_Data
+USER app
+
 COPY --from=build /app/publish .
-VOLUME ["/app/App_Data"]
+
 EXPOSE 8080
 ENTRYPOINT ["dotnet", "LegalPilot.Api.dll"]
