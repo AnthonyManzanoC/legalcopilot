@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+.git/
+.build/
+**/App_Data/
+.env
+.env.*
+!.env.example
+node_modules/
+coverage/

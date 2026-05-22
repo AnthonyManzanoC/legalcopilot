@@ -1,0 +1,40 @@
+services:
+  legalpilot-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "5056:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      LegalPilot__Issuer: legalpilot-ecuador
+      LegalPilot__TokenSigningKey: ${LEGALPILOT_TOKEN_SIGNING_KEY}
+      LegalPilot__Security__DataProtectionKey: ${LEGALPILOT_DATA_PROTECTION_KEY}
+      LEGALPILOT_DATABASE_URL: ${LEGALPILOT_DATABASE_URL:-}
+      LegalPilot__Storage__Path: /app/App_Data/legalpilot-store.json
+      LegalPilot__Storage__RequirePostgres: "true"
+      LegalPilot__Bootstrap__TenantName: ${LEGALPILOT_BOOTSTRAP_TENANT_NAME:-LegalPilot Ecuador}
+      LegalPilot__Bootstrap__AdminEmail: ${LEGALPILOT_BOOTSTRAP_ADMIN_EMAIL:-}
+      LegalPilot__Bootstrap__AdminPassword: ${LEGALPILOT_BOOTSTRAP_ADMIN_PASSWORD:-}
+      LegalPilot__Gmail__ClientId: ${LEGALPILOT_GMAIL_CLIENT_ID:-}
+      LegalPilot__Gmail__ClientSecret: ${LEGALPILOT_GMAIL_CLIENT_SECRET:-}
+      LegalPilot__Gmail__RedirectUri: ${LEGALPILOT_GMAIL_REDIRECT_URI:-}
+      LegalPilot__Gmail__WebhookSecret: ${LEGALPILOT_GMAIL_WEBHOOK_SECRET:-}
+      LegalPilot__Microsoft__ClientId: ${LEGALPILOT_MICROSOFT_CLIENT_ID:-}
+      LegalPilot__Microsoft__ClientSecret: ${LEGALPILOT_MICROSOFT_CLIENT_SECRET:-}
+      LegalPilot__Microsoft__TenantId: ${LEGALPILOT_MICROSOFT_TENANT_ID:-}
+      LegalPilot__Microsoft__RedirectUri: ${LEGALPILOT_MICROSOFT_REDIRECT_URI:-}
+      LegalPilot__Microsoft__WebhookClientState: ${LEGALPILOT_MICROSOFT_WEBHOOK_CLIENT_STATE:-}
+      LegalPilot__OpenWa__BaseUrl: ${LEGALPILOT_OPENWA_BASE_URL:-}
+      LegalPilot__OpenWa__ApiKey: ${LEGALPILOT_OPENWA_API_KEY:-}
+      LegalPilot__OpenWa__WebhookSecret: ${LEGALPILOT_OPENWA_WEBHOOK_SECRET:-}
+      LegalPilot__AI__Provider: ${LEGALPILOT_AI_PROVIDER:-}
+      LegalPilot__AI__Model: ${LEGALPILOT_AI_MODEL:-}
+      LegalPilot__AI__EmbeddingModel: ${LEGALPILOT_AI_EMBEDDING_MODEL:-}
+      LegalPilot__AI__ApiKey: ${LEGALPILOT_AI_API_KEY:-}
+    volumes:
+      - legalpilot_data:/app/App_Data
+    restart: unless-stopped
+
+volumes:
+  legalpilot_data:

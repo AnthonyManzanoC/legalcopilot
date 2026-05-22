@@ -1,0 +1,623 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LegalPilot Ecuador</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <aside class="sidebar hidden">
+      <div class="brand">
+        <div class="mark">LP</div>
+        <div>
+          <strong>LegalPilot</strong>
+          <span>Ecuador</span>
+        </div>
+      </div>
+      <nav aria-label="Secciones">
+        <button class="nav active" data-view="dashboard">Tablero</button>
+        <button class="nav" data-view="inbox">Inbox legal</button>
+        <button class="nav" data-view="deadlines">Plazos</button>
+        <button class="nav" data-view="calendar">Calendario</button>
+        <button class="nav" data-view="cases">Casos</button>
+        <button class="nav" data-view="clients">Clientes</button>
+        <button class="nav" data-view="chat">Chat</button>
+        <button class="nav" data-view="ai">IA legal</button>
+        <button class="nav" data-view="alerts">Alertas</button>
+        <button class="nav" data-view="integrations">Integraciones</button>
+        <button class="nav" data-view="reports">Reportes</button>
+        <button class="nav" data-view="system">Estado</button>
+        <button class="nav" data-view="settings">Configuracion</button>
+        <button class="nav" data-view="audit">Auditoria</button>
+      </nav>
+      <button id="logoutBtn" class="ghost">Salir</button>
+    </aside>
+
+    <section class="workspace">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Operacion legal inteligente</p>
+          <h1 id="viewTitle">Tablero</h1>
+        </div>
+        <div class="topbar-actions">
+          <div id="systemChip" class="status-chip">Verificando</div>
+          <div id="userBox" class="userbox">Sin sesion</div>
+        </div>
+      </header>
+
+      <section id="loginPanel" class="login-panel">
+        <form id="loginForm" class="login-box">
+          <div>
+            <p class="eyebrow">Acceso seguro</p>
+            <h2>Entrar a LegalPilot</h2>
+          </div>
+          <label>
+            Correo
+            <input name="email" type="email" placeholder="abogado@estudio.ec" autocomplete="username" required>
+          </label>
+          <label>
+            Contrasena
+            <input name="password" type="password" autocomplete="current-password" required>
+          </label>
+          <button type="submit">Entrar</button>
+          <button type="button" class="ghost inline" id="forgotToggle">Recuperar contrasena</button>
+          <p id="loginError" class="error"></p>
+        </form>
+
+        <form id="forgotForm" class="login-box hidden">
+          <div>
+            <p class="eyebrow">Recuperacion</p>
+            <h2>Restablecer acceso</h2>
+          </div>
+          <label>
+            Correo
+            <input name="email" type="email" placeholder="abogado@estudio.ec" autocomplete="username" required>
+          </label>
+          <button type="submit">Generar token</button>
+          <label>
+            Token
+            <input name="token" autocomplete="one-time-code">
+          </label>
+          <label>
+            Nueva contrasena
+            <input name="newPassword" type="password" minlength="10" autocomplete="new-password">
+          </label>
+          <button type="button" id="resetPasswordBtn">Actualizar contrasena</button>
+          <button type="button" class="ghost inline" id="backToLogin">Volver al login</button>
+          <p id="forgotMessage" class="muted"></p>
+        </form>
+      </section>
+
+      <section id="appPanel" class="app-panel hidden">
+        <section id="dashboard" class="view active-view">
+          <div id="metrics" class="metrics"></div>
+          <div class="split">
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Ingresar correo legal</h2>
+                <button id="demoEmailBtn" class="compact">Cargar demo</button>
+              </div>
+              <form id="manualEmailForm" class="grid-form">
+                <label>
+                  Caso
+                  <select name="caseId" data-case-select>
+                    <option value="">Detectar por causa</option>
+                  </select>
+                </label>
+                <label>
+                  Proveedor
+                  <select name="provider">
+                    <option value="Gmail">Gmail</option>
+                    <option value="Outlook">Outlook / Hotmail</option>
+                  </select>
+                </label>
+                <label>
+                  Asunto
+                  <input name="subject" required>
+                </label>
+                <label>
+                  Remitente
+                  <input name="sender" value="notificaciones@funcionjudicial.gob.ec" required>
+                </label>
+                <label class="wide">
+                  Cuerpo
+                  <textarea name="bodyText" rows="8" required></textarea>
+                </label>
+                <button type="submit">Procesar correo</button>
+              </form>
+            </section>
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Riesgo operativo</h2>
+                <button class="compact" data-refresh="dashboard">Actualizar</button>
+              </div>
+              <div id="dashboardFocus" class="list"></div>
+            </section>
+          </div>
+        </section>
+
+        <section id="inbox" class="view">
+          <div class="panel">
+            <div class="panel-head">
+              <h2>Correos procesados</h2>
+              <button class="compact" data-refresh="inbox">Actualizar</button>
+            </div>
+            <div id="inboxList" class="list"></div>
+          </div>
+        </section>
+
+        <section id="deadlines" class="view">
+          <div class="split">
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Plazos</h2>
+                <button class="compact" data-refresh="deadlines">Actualizar</button>
+              </div>
+              <div id="deadlineList" class="list"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Nuevo plazo</h2>
+              </div>
+              <form id="deadlineForm" class="grid-form">
+                <label class="wide">
+                  Titulo
+                  <input name="title" placeholder="Contestacion demanda / escrito pendiente" required>
+                </label>
+                <label>
+                  Caso
+                  <select name="caseId" data-case-select>
+                    <option value="">Sin caso</option>
+                  </select>
+                </label>
+                <label>
+                  Fecha base
+                  <input name="notificationDate" type="date" required>
+                </label>
+                <label>
+                  Dias habiles
+                  <input name="termDays" type="number" min="1" max="180" value="5" required>
+                </label>
+                <label>
+                  Materia
+                  <input name="matter" value="general" required>
+                </label>
+                <label>
+                  Provincia
+                  <input name="province" placeholder="Pichincha">
+                </label>
+                <label>
+                  Canton
+                  <input name="canton" placeholder="Quito">
+                </label>
+                <label class="check">
+                  <input name="confirmed" type="checkbox" checked>
+                  Confirmado por abogado
+                </label>
+                <button type="submit">Calcular y guardar</button>
+              </form>
+              <div id="deadlinePreview" class="preview"></div>
+            </section>
+          </div>
+        </section>
+
+        <section id="calendar" class="view">
+          <div class="split">
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Eventos</h2>
+                <button class="compact" data-refresh="calendar">Actualizar</button>
+              </div>
+              <div id="calendarList" class="list"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Evento manual</h2>
+              </div>
+              <form id="calendarForm" class="grid-form">
+                <label class="wide">
+                  Titulo
+                  <input name="title" required>
+                </label>
+                <label>
+                  Caso
+                  <select name="caseId" data-case-select>
+                    <option value="">Sin caso</option>
+                  </select>
+                </label>
+                <label>
+                  Tipo
+                  <select name="type">
+                    <option value="Hearing">Audiencia</option>
+                    <option value="Diligence">Diligencia</option>
+                    <option value="Meeting">Reunion</option>
+                    <option value="Task">Tarea</option>
+                  </select>
+                </label>
+                <label>
+                  Inicio
+                  <input name="startsAt" type="datetime-local" required>
+                </label>
+                <label>
+                  Fin
+                  <input name="endsAt" type="datetime-local" required>
+                </label>
+                <label class="wide">
+                  Lugar
+                  <input name="location">
+                </label>
+                <button type="submit">Crear evento</button>
+              </form>
+            </section>
+          </div>
+        </section>
+
+        <section id="cases" class="view">
+          <div class="split">
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Casos</h2>
+                <button class="compact" data-refresh="cases">Actualizar</button>
+              </div>
+              <div id="caseList" class="list"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Nuevo caso</h2>
+              </div>
+              <form id="caseForm" class="grid-form">
+                <label class="wide">
+                  Titulo
+                  <input name="title" required>
+                </label>
+                <label>
+                  Numero de causa
+                  <input name="caseNumber" placeholder="17230-2026-00001" required>
+                </label>
+                <label>
+                  Materia
+                  <input name="matter" required>
+                </label>
+                <label>
+                  Dependencia
+                  <input name="courtOrOffice" required>
+                </label>
+                <label>
+                  Cliente
+                  <select name="clientId" data-client-select>
+                    <option value="">Sin cliente</option>
+                  </select>
+                </label>
+                <button type="submit">Crear caso</button>
+              </form>
+            </section>
+          </div>
+        </section>
+
+        <section id="clients" class="view">
+          <div class="split">
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Clientes</h2>
+                <button class="compact" data-refresh="clients">Actualizar</button>
+              </div>
+              <div id="clientList" class="list"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Nuevo cliente</h2>
+              </div>
+              <form id="clientForm" class="grid-form">
+                <label class="wide">
+                  Nombre completo
+                  <input name="fullName" required>
+                </label>
+                <label>
+                  Correo
+                  <input name="email" type="email" required>
+                </label>
+                <label>
+                  Telefono
+                  <input name="phone" required>
+                </label>
+                <label class="wide">
+                  Identificacion
+                  <input name="identification" required>
+                </label>
+                <button type="submit">Crear cliente</button>
+              </form>
+            </section>
+          </div>
+        </section>
+
+        <section id="chat" class="view">
+          <div class="split">
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Mensajes</h2>
+                <button class="compact" data-refresh="chat">Actualizar</button>
+              </div>
+              <div id="chatList" class="list chat-list"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Enviar / registrar</h2>
+              </div>
+              <form id="chatForm" class="grid-form">
+                <label>
+                  Cliente
+                  <select name="clientId" data-client-select>
+                    <option value="">Sin cliente</option>
+                  </select>
+                </label>
+                <label>
+                  Caso
+                  <select name="caseId" data-case-select>
+                    <option value="">Sin caso</option>
+                  </select>
+                </label>
+                <label>
+                  Canal
+                  <select name="channel">
+                    <option value="Panel">Panel</option>
+                    <option value="WhatsApp">WhatsApp</option>
+                    <option value="Email">Email</option>
+                  </select>
+                </label>
+                <label>
+                  Direccion
+                  <select name="direction">
+                    <option value="Internal">Interno</option>
+                    <option value="Outbound">Saliente</option>
+                    <option value="Inbound">Entrante</option>
+                  </select>
+                </label>
+                <label class="wide">
+                  Mensaje
+                  <textarea name="body" rows="5" required></textarea>
+                </label>
+                <label class="check">
+                  <input name="requiresHumanReview" type="checkbox" checked>
+                  Requiere revision humana
+                </label>
+                <button type="submit">Guardar mensaje</button>
+              </form>
+              <form id="whatsappForm" class="grid-form stacked-form">
+                <label>
+                  Cliente
+                  <select name="clientId" data-client-select>
+                    <option value="">Telefono manual</option>
+                  </select>
+                </label>
+                <label>
+                  Telefono
+                  <input name="to" placeholder="+593999000111">
+                </label>
+                <label class="wide">
+                  Mensaje WhatsApp
+                  <textarea name="body" rows="4" required></textarea>
+                </label>
+                <label class="check">
+                  <input name="approved" type="checkbox">
+                  Enviar aprobado
+                </label>
+                <button type="submit">Enviar por OpenWA</button>
+              </form>
+            </section>
+          </div>
+        </section>
+
+        <section id="alerts" class="view">
+          <div class="split">
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Alertas</h2>
+                <button class="compact" data-refresh="alerts">Actualizar</button>
+              </div>
+              <div id="alertList" class="list"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Recordatorios</h2>
+              </div>
+              <div id="reminderList" class="list"></div>
+            </section>
+          </div>
+        </section>
+
+        <section id="ai" class="view">
+          <div class="split">
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Pipeline IA</h2>
+                <button class="compact" data-refresh="ai">Actualizar</button>
+              </div>
+              <div id="aiStatus" class="list"></div>
+              <form id="aiKnowledgeForm" class="grid-form stacked-form">
+                <label class="wide">
+                  Fuente RAG
+                  <input name="title" placeholder="Plantilla de providencia / correos etiquetados" required>
+                </label>
+                <label>
+                  Tipo
+                  <input name="sourceType" value="legal-document" required>
+                </label>
+                <label>
+                  Referencia
+                  <input name="sourceReference" placeholder="s3://bucket/documento.pdf o codigo interno" required>
+                </label>
+                <label>
+                  Etiquetas
+                  <input name="tags" placeholder="providencia, civil, plazo">
+                </label>
+                <label>
+                  Chunks
+                  <input name="chunkCount" type="number" min="0" value="0">
+                </label>
+                <label class="check">
+                  <input name="indexed" type="checkbox">
+                  Ya indexado
+                </label>
+                <button type="submit">Registrar fuente</button>
+              </form>
+            </section>
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Probar clasificacion</h2>
+              </div>
+              <form id="aiAnalyzeForm" class="grid-form">
+                <label class="wide">
+                  Asunto
+                  <input name="subject" required>
+                </label>
+                <label class="wide">
+                  Texto
+                  <textarea name="bodyText" rows="8" required></textarea>
+                </label>
+                <button type="submit">Analizar sin calcular plazo</button>
+              </form>
+              <div id="aiResult" class="preview"></div>
+            </section>
+          </div>
+        </section>
+
+        <section id="integrations" class="view">
+          <div class="split">
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Buzones</h2>
+                <button class="compact" data-refresh="integrations">Actualizar</button>
+              </div>
+              <form id="mailboxForm" class="grid-form">
+                <label>
+                  Proveedor
+                  <select name="provider">
+                    <option value="Gmail">Gmail</option>
+                    <option value="Outlook">Outlook / Hotmail</option>
+                  </select>
+                </label>
+                <label>
+                  Correo
+                  <input name="email" type="email" placeholder="abogado@estudio.ec" required>
+                </label>
+                <button type="submit">Registrar buzon</button>
+                <button type="button" class="ghost inline" id="oauthStartBtn">Iniciar OAuth seguro</button>
+              </form>
+              <div id="oauthBox" class="oauth-box muted">OAuth se habilita cuando Gmail/Microsoft tengan credenciales configuradas.</div>
+              <div id="mailboxes" class="list"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Estado de integraciones</h2>
+              </div>
+              <div id="integrationStatus" class="list"></div>
+              <div id="syncStates" class="list section-gap"></div>
+            </section>
+          </div>
+        </section>
+
+        <section id="reports" class="view">
+          <div class="split">
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Reporte ejecutivo</h2>
+                <button class="compact" data-refresh="reports">Actualizar</button>
+              </div>
+              <div id="reportOverview" class="report-grid"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Riesgo y productividad</h2>
+              </div>
+              <div id="reportRisk" class="list"></div>
+            </section>
+          </div>
+        </section>
+
+        <section id="system" class="view">
+          <div class="split">
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Estado del sistema</h2>
+                <button class="compact" data-refresh="system">Actualizar</button>
+              </div>
+              <div id="systemStatus" class="system-grid"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Infraestructura activa</h2>
+              </div>
+              <div id="systemInfra" class="list"></div>
+            </section>
+          </div>
+        </section>
+
+        <section id="settings" class="view">
+          <div class="split">
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Feriados y excepciones</h2>
+                <button class="compact" data-refresh="settings">Actualizar</button>
+              </div>
+              <div id="holidayList" class="list"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Nueva regla calendario</h2>
+              </div>
+              <form id="holidayForm" class="grid-form">
+                <label>
+                  Fecha
+                  <input name="date" type="date" required>
+                </label>
+                <label>
+                  Nombre
+                  <input name="name" required>
+                </label>
+                <label>
+                  Alcance
+                  <select name="scope">
+                    <option value="National">Nacional</option>
+                    <option value="Province">Provincia</option>
+                    <option value="Canton">Canton</option>
+                    <option value="Court">Judicatura</option>
+                    <option value="TenantException">Excepcion estudio</option>
+                  </select>
+                </label>
+                <label>
+                  Provincia
+                  <input name="province">
+                </label>
+                <label>
+                  Canton
+                  <input name="canton">
+                </label>
+                <label class="check">
+                  <input name="isBusinessDayOverride" type="checkbox">
+                  Habilitar como dia laborable
+                </label>
+                <button type="submit">Guardar regla</button>
+              </form>
+            </section>
+          </div>
+        </section>
+
+        <section id="audit" class="view">
+          <div class="panel">
+            <div class="panel-head">
+              <h2>Bitacora</h2>
+              <button class="compact" data-refresh="audit">Actualizar</button>
+            </div>
+            <div id="auditList" class="list"></div>
+          </div>
+        </section>
+      </section>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
