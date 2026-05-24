@@ -20,14 +20,18 @@ services:
       LegalPilot__Gmail__ClientSecret: ${LEGALPILOT_GMAIL_CLIENT_SECRET:-}
       LegalPilot__Gmail__RedirectUri: ${LEGALPILOT_GMAIL_REDIRECT_URI:-}
       LegalPilot__Gmail__WebhookSecret: ${LEGALPILOT_GMAIL_WEBHOOK_SECRET:-}
+      LegalPilot__Gmail__PubSubTopicName: ${LEGALPILOT_GMAIL_PUBSUB_TOPIC_NAME:-projects/legalcopilot-497022/topics/notificaciones-gmail}
       LegalPilot__Microsoft__ClientId: ${LEGALPILOT_MICROSOFT_CLIENT_ID:-}
       LegalPilot__Microsoft__ClientSecret: ${LEGALPILOT_MICROSOFT_CLIENT_SECRET:-}
       LegalPilot__Microsoft__TenantId: ${LEGALPILOT_MICROSOFT_TENANT_ID:-}
       LegalPilot__Microsoft__RedirectUri: ${LEGALPILOT_MICROSOFT_REDIRECT_URI:-}
       LegalPilot__Microsoft__WebhookClientState: ${LEGALPILOT_MICROSOFT_WEBHOOK_CLIENT_STATE:-}
+      LegalPilot__Microsoft__WebhookNotificationUrl: ${LEGALPILOT_MICROSOFT_WEBHOOK_NOTIFICATION_URL:-https://legalcopilot-ryhr.onrender.com/api/webhooks/microsoft}
       LegalPilot__OpenWa__BaseUrl: ${LEGALPILOT_OPENWA_BASE_URL:-}
       LegalPilot__OpenWa__ApiKey: ${LEGALPILOT_OPENWA_API_KEY:-}
+      LegalPilot__OpenWa__SessionId: ${LEGALPILOT_OPENWA_SESSION_ID:-}
       LegalPilot__OpenWa__WebhookSecret: ${LEGALPILOT_OPENWA_WEBHOOK_SECRET:-}
+      LegalPilot__Calendar__PreferredProvider: ${LEGALPILOT_CALENDAR_PREFERRED_PROVIDER:-auto}
       LegalPilot__AI__Provider: ${LEGALPILOT_AI_PROVIDER:-}
       LegalPilot__AI__Model: ${LEGALPILOT_AI_MODEL:-}
       LegalPilot__AI__EmbeddingModel: ${LEGALPILOT_AI_EMBEDDING_MODEL:-}

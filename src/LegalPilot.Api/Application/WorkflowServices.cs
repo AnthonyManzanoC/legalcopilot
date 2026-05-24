@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using LegalPilot.Api.Domain;
@@ -397,6 +398,34 @@ public sealed class MailboxService(LegalPilotStore store, EmailConnectorRegistry
         var connector = connectors.Get(mailbox.Provider);
         var result = await connector.SyncAsync(mailbox, cancellationToken);
 
+        return RecordSyncState(mailbox, result, principal.UserId);
+    }
+
+    public async Task<MailboxSyncState?> SyncProviderFromWebhook(Guid tenantId, MailProvider provider, string? emailAddress, CancellationToken cancellationToken)
+    {
+        var mailbox = store.Read(() =>
+        {
+            var query = store.Mailboxes.Where(m => m.TenantId == tenantId && m.Provider == provider);
+            if (!string.IsNullOrWhiteSpace(emailAddress))
+            {
+                var normalized = emailAddress.Trim();
+                return query.FirstOrDefault(m => m.Email.Equals(normalized, StringComparison.OrdinalIgnoreCase)) ?? query.FirstOrDefault();
+            }
+
+            return query.FirstOrDefault();
+        });
+
+        if (mailbox is null)
+        {
+            return null;
+        }
+
+        var result = await connectors.Get(provider).SyncAsync(mailbox, cancellationToken);
+        return RecordSyncState(mailbox, result, null);
+    }
+
+    private MailboxSyncState RecordSyncState(MailboxConnection mailbox, MailboxSyncResult result, Guid? actorUserId)
+    {
         return store.Write(() =>
         {
             var previousFailures = store.MailboxSyncStates
@@ -406,7 +435,7 @@ public sealed class MailboxService(LegalPilotStore store, EmailConnectorRegistry
 
             var state = new MailboxSyncState(
                 Guid.NewGuid(),
-                principal.TenantId,
+                mailbox.TenantId,
                 mailbox.Id,
                 mailbox.Provider,
                 result.Status,
@@ -422,7 +451,7 @@ public sealed class MailboxService(LegalPilotStore store, EmailConnectorRegistry
                 Status = result.Status,
                 LastSyncAt = DateTimeOffset.UtcNow
             };
-            store.Audit(principal.TenantId, principal.UserId, AuditAction.SyncAttempt, nameof(MailboxConnection), mailbox.Id.ToString(), result.Message);
+            store.Audit(mailbox.TenantId, actorUserId, AuditAction.SyncAttempt, nameof(MailboxConnection), mailbox.Id.ToString(), result.Message);
             return state;
         });
     }
@@ -452,12 +481,15 @@ public sealed class LegalWorkflowService(
             }
         }
 
-        var extraction = intelligence.Extract(subject, bodyText);
+        var emailId = Guid.NewGuid();
+        var attachments = BuildAttachments(principal.TenantId, emailId, request.Attachments);
+        var analysisBody = AppendAttachmentText(bodyText, attachments);
+        var extraction = intelligence.Extract(subject, analysisBody);
         var caseId = ResolveCaseId(principal.TenantId, extraction.CaseNumber, request.CaseId);
         var now = DateTimeOffset.UtcNow;
 
         var email = new LegalEmail(
-            Guid.NewGuid(),
+            emailId,
             principal.TenantId,
             request.MailboxConnectionId,
             caseId,
@@ -466,14 +498,18 @@ public sealed class LegalWorkflowService(
             subject,
             sender,
             request.Recipients ?? [],
-            bodyText,
+            analysisBody,
             InputGuard.Optional(request.RawReference, 200) is { Length: > 0 } rawReference ? rawReference : "manual",
             request.ReceivedAt ?? now,
             "Processed",
             extraction,
             now);
 
-        store.Write(() => store.Emails.Insert(0, email));
+        store.Write(() =>
+        {
+            store.Emails.Insert(0, email);
+            store.Attachments.AddRange(attachments);
+        });
         store.Audit(principal.TenantId, principal.UserId, AuditAction.IngestEmail, nameof(LegalEmail), email.Id.ToString(), $"Correo legal ingerido: {email.Subject}");
         store.Audit(principal.TenantId, principal.UserId, AuditAction.ClassifyEmail, nameof(LegalEmail), email.Id.ToString(), extraction.LawyerSummary);
 
@@ -497,11 +533,14 @@ public sealed class LegalWorkflowService(
         var subject = InputGuard.Required(envelope.Subject, "Asunto", 240);
         var sender = InputGuard.Required(envelope.Sender, "Remitente", 254);
         var bodyText = InputGuard.TextBlock(envelope.BodyText, "Cuerpo", 12000);
-        var extraction = intelligence.Extract(subject, bodyText);
+        var emailId = Guid.NewGuid();
+        var attachments = BuildAttachments(tenantId, emailId, envelope.Attachments);
+        var analysisBody = AppendAttachmentText(bodyText, attachments);
+        var extraction = intelligence.Extract(subject, analysisBody);
         var caseId = ResolveCaseId(tenantId, extraction.CaseNumber, null);
         var now = DateTimeOffset.UtcNow;
         var email = new LegalEmail(
-            Guid.NewGuid(),
+            emailId,
             tenantId,
             null,
             caseId,
@@ -510,15 +549,19 @@ public sealed class LegalWorkflowService(
             subject,
             sender,
             envelope.Recipients ?? [],
-            bodyText,
+            analysisBody,
             InputGuard.Optional(envelope.RawReference, 200) is { Length: > 0 } rawReference ? rawReference : provider.ToString(),
             envelope.ReceivedAt ?? now,
             "ProcessedFromWebhook",
             extraction,
             now);
 
-        store.Write(() => store.Emails.Insert(0, email));
-        store.Audit(tenantId, null, AuditAction.WebhookReceived, nameof(LegalEmail), email.Id.ToString(), $"Webhook {provider} procesado.");
+        store.Write(() =>
+        {
+            store.Emails.Insert(0, email);
+            store.Attachments.AddRange(attachments);
+        });
+        store.Audit(tenantId, null, AuditAction.WebhookReceived, nameof(LegalEmail), email.Id.ToString(), $"Webhook {provider} procesado. Adjuntos: {attachments.Count}.");
         CreateDerivedWork(email, null);
         return email;
     }
@@ -661,6 +704,7 @@ public sealed class LegalWorkflowService(
 
         var responsible = ResolveResponsible(email);
         var holidays = store.Read(() => store.Holidays.Where(h => h.TenantId == email.TenantId).ToArray());
+        CreateInboxNotification(email, responsible);
 
         if (email.Extraction.TermDays.HasValue && !store.Read(() => store.Deadlines.Any(d => d.TenantId == email.TenantId && d.LegalEmailId == email.Id)))
         {
@@ -782,34 +826,230 @@ public sealed class LegalWorkflowService(
                 continue;
             }
 
-            var duplicate = store.Read(() => store.Reminders.Any(r =>
-                r.TenantId == tenantId &&
-                r.CalendarEventId == calendarEvent.Id &&
-                r.SendAt == sendAt &&
-                r.Message == (offset == 0 ? $"Hoy: {title}" : $"Recordatorio T-{offset}: {title}")));
-
-            if (duplicate)
+            var message = offset == 0 ? $"Hoy: {title}" : $"Recordatorio T-{offset}: {title}";
+            var channels = ReminderChannels(calendarEvent, offset);
+            foreach (var channel in channels)
             {
-                continue;
-            }
+                var duplicate = store.Read(() => store.Reminders.Any(r =>
+                    r.TenantId == tenantId &&
+                    r.CalendarEventId == calendarEvent.Id &&
+                    r.Channel == channel &&
+                    r.SendAt == sendAt &&
+                    r.Message == message));
 
-            reminders.Add(new Reminder(
-                Guid.NewGuid(),
-                tenantId,
-                calendarEvent.Id,
-                NotificationChannel.Panel,
-                sendAt,
-                offset == 0 ? $"Hoy: {title}" : $"Recordatorio T-{offset}: {title}",
-                NotificationStatus.Pending,
-                DateTimeOffset.UtcNow));
+                if (duplicate)
+                {
+                    continue;
+                }
+
+                reminders.Add(new Reminder(
+                    Guid.NewGuid(),
+                    tenantId,
+                    calendarEvent.Id,
+                    channel,
+                    sendAt,
+                    message,
+                    NotificationStatus.Pending,
+                    DateTimeOffset.UtcNow));
+            }
         }
 
         store.Write(() => store.Reminders.AddRange(reminders));
     }
 
+    private NotificationChannel[] ReminderChannels(CalendarEvent calendarEvent, int offset)
+    {
+        if (offset is 7 or 1 or 0 && ClientForEvent(calendarEvent) is { Phone.Length: > 0 })
+        {
+            return [NotificationChannel.Panel, NotificationChannel.WhatsApp];
+        }
+
+        return [NotificationChannel.Panel];
+    }
+
+    private ClientProfile? ClientForEvent(CalendarEvent calendarEvent)
+    {
+        if (!calendarEvent.CaseId.HasValue)
+        {
+            return null;
+        }
+
+        return store.Read(() =>
+        {
+            var legalCase = store.Cases.FirstOrDefault(c => c.Id == calendarEvent.CaseId.Value && c.TenantId == calendarEvent.TenantId);
+            return legalCase?.ClientId is { } clientId
+                ? store.Clients.FirstOrDefault(c => c.Id == clientId && c.TenantId == calendarEvent.TenantId)
+                : null;
+        });
+    }
+
+    private void CreateInboxNotification(LegalEmail email, Guid responsible)
+    {
+        var title = email.Extraction?.Priority.Equals("Alta", StringComparison.OrdinalIgnoreCase) == true
+            ? "Correo legal urgente"
+            : "Correo legal procesado";
+        var message = email.Extraction?.LawyerSummary ?? email.Subject;
+        store.Write(() =>
+        {
+            var duplicate = store.Notifications.Any(n =>
+                n.TenantId == email.TenantId &&
+                n.UserId == responsible &&
+                n.Title == title &&
+                n.Message == message &&
+                n.CreatedAt > DateTimeOffset.UtcNow.AddMinutes(-5));
+            if (duplicate)
+            {
+                return;
+            }
+
+            store.Notifications.Insert(0, new Notification(
+                Guid.NewGuid(),
+                email.TenantId,
+                responsible,
+                NotificationChannel.Panel,
+                title,
+                message,
+                NotificationStatus.Sent,
+                DateTimeOffset.UtcNow,
+                DateTimeOffset.UtcNow,
+                null));
+        });
+    }
+
+    private static List<DocumentAttachment> BuildAttachments(Guid tenantId, Guid legalEmailId, IEnumerable<EmailAttachmentInput>? inputs)
+    {
+        var attachments = new List<DocumentAttachment>();
+        foreach (var input in inputs ?? [])
+        {
+            var fileName = InputGuard.Optional(input.FileName, 180);
+            if (string.IsNullOrWhiteSpace(fileName))
+            {
+                fileName = "adjunto";
+            }
+
+            var contentType = InputGuard.Optional(input.ContentType, 120);
+            if (string.IsNullOrWhiteSpace(contentType))
+            {
+                contentType = "application/octet-stream";
+            }
+
+            var bytes = DecodeAttachmentBytes(input);
+            var sha = Convert.ToHexString(SHA256.HashData(bytes));
+            var ocrText = DocumentTextExtractor.ExtractText(fileName, contentType, bytes, input.TextContent);
+            attachments.Add(new DocumentAttachment(
+                Guid.NewGuid(),
+                tenantId,
+                legalEmailId,
+                fileName,
+                contentType,
+                bytes.LongLength,
+                $"emails/{legalEmailId:N}/attachments/{sha[..16]}-{fileName}",
+                sha,
+                ocrText,
+                DateTimeOffset.UtcNow));
+        }
+
+        return attachments
+            .GroupBy(a => a.Sha256)
+            .Select(g => g.First())
+            .ToList();
+    }
+
+    private static byte[] DecodeAttachmentBytes(EmailAttachmentInput input)
+    {
+        if (!string.IsNullOrWhiteSpace(input.ContentBase64))
+        {
+            try
+            {
+                return Convert.FromBase64String(input.ContentBase64);
+            }
+            catch (FormatException)
+            {
+                throw new ArgumentException($"Adjunto {input.FileName} no tiene base64 valido.");
+            }
+        }
+
+        return Encoding.UTF8.GetBytes(input.TextContent ?? string.Empty);
+    }
+
+    private static string AppendAttachmentText(string bodyText, IReadOnlyList<DocumentAttachment> attachments)
+    {
+        var readable = attachments
+            .Where(a => !string.IsNullOrWhiteSpace(a.OcrText))
+            .Select(a => $"[Adjunto: {a.FileName}]\n{a.OcrText}")
+            .ToArray();
+
+        if (readable.Length == 0)
+        {
+            return bodyText;
+        }
+
+        var combined = $"{bodyText}\n\n--- Texto extraido de adjuntos ---\n{string.Join("\n\n", readable)}";
+        return combined.Length <= 12000 ? combined : combined[..12000];
+    }
+
     private static DateTimeOffset ToQuitoDateTimeOffset(DateOnly date, TimeOnly time)
     {
         return new DateTimeOffset(date.ToDateTime(time), TimeSpan.FromHours(-5));
+    }
+}
+
+public static class DocumentTextExtractor
+{
+    public static string? ExtractText(string fileName, string contentType, byte[] bytes, string? providedText)
+    {
+        if (!string.IsNullOrWhiteSpace(providedText))
+        {
+            return InputGuard.TextBlock(providedText, "Texto OCR", 12000);
+        }
+
+        if (contentType.StartsWith("text/", StringComparison.OrdinalIgnoreCase) ||
+            fileName.EndsWith(".txt", StringComparison.OrdinalIgnoreCase) ||
+            fileName.EndsWith(".csv", StringComparison.OrdinalIgnoreCase))
+        {
+            return TrimForIndex(Encoding.UTF8.GetString(bytes));
+        }
+
+        if (contentType.Contains("pdf", StringComparison.OrdinalIgnoreCase) ||
+            fileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
+        {
+            var candidate = ExtractPrintablePdfText(bytes);
+            return string.IsNullOrWhiteSpace(candidate)
+                ? "[OCR pendiente: PDF recibido y persistido con hash. Configure un proveedor OCR para texto completo.]"
+                : TrimForIndex(candidate);
+        }
+
+        if (contentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase))
+        {
+            return "[OCR pendiente: imagen recibida y persistida con hash. Configure un proveedor OCR para texto completo.]";
+        }
+
+        return null;
+    }
+
+    private static string ExtractPrintablePdfText(byte[] bytes)
+    {
+        var text = Encoding.Latin1.GetString(bytes);
+        var builder = new StringBuilder();
+        foreach (var c in text)
+        {
+            if (c is >= ' ' and <= '~' or '\n' or '\r' or '\t')
+            {
+                builder.Append(c);
+            }
+            else if (builder.Length > 0 && builder[^1] != ' ')
+            {
+                builder.Append(' ');
+            }
+        }
+
+        return builder.ToString();
+    }
+
+    private static string TrimForIndex(string value)
+    {
+        value = value.Trim();
+        return value.Length <= 12000 ? value : value[..12000];
     }
 }
 
@@ -848,58 +1088,142 @@ public sealed class NotificationService(LegalPilotStore store)
 
 public sealed class ReminderDispatcher(
     LegalPilotStore store,
+    OpenWaClient openWa,
     ILogger<ReminderDispatcher> logger) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         while (!stoppingToken.IsCancellationRequested)
         {
-            DispatchDueReminders();
+            await DispatchDueReminders(stoppingToken);
             await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
         }
     }
 
-    private void DispatchDueReminders()
+    private async Task DispatchDueReminders(CancellationToken cancellationToken)
     {
         try
         {
-            store.Write(() =>
+            var due = store.Read(() => store.Reminders
+                .Where(r => r.Status == NotificationStatus.Pending && r.SendAt <= DateTimeOffset.UtcNow)
+                .Take(25)
+                .ToArray());
+
+            foreach (var reminder in due)
             {
-                var due = store.Reminders
-                    .Where(r => r.Status == NotificationStatus.Pending && r.SendAt <= DateTimeOffset.UtcNow)
-                    .Take(25)
-                    .ToArray();
-
-                foreach (var reminder in due)
+                var eventItem = store.Read(() => store.CalendarEvents.FirstOrDefault(e => e.Id == reminder.CalendarEventId));
+                if (eventItem is null)
                 {
-                    var eventItem = store.CalendarEvents.FirstOrDefault(e => e.Id == reminder.CalendarEventId);
-                    if (eventItem is null)
-                    {
-                        continue;
-                    }
-
-                    store.Notifications.Insert(0, new Notification(
-                        Guid.NewGuid(),
-                        reminder.TenantId,
-                        eventItem.ResponsibleUserId,
-                        reminder.Channel,
-                        eventItem.Type.ToString(),
-                        reminder.Message,
-                        NotificationStatus.Sent,
-                        DateTimeOffset.UtcNow,
-                        DateTimeOffset.UtcNow,
-                        null));
-
-                    var index = store.Reminders.FindIndex(r => r.Id == reminder.Id);
-                    store.Reminders[index] = reminder with { Status = NotificationStatus.Sent };
-                    store.Audit(reminder.TenantId, eventItem.ResponsibleUserId, AuditAction.SendNotification, nameof(Reminder), reminder.Id.ToString(), reminder.Message);
+                    MarkReminder(reminder, NotificationStatus.Failed, null, "Evento asociado no encontrado.");
+                    continue;
                 }
-            });
+
+                if (reminder.Channel == NotificationChannel.WhatsApp)
+                {
+                    await DispatchWhatsAppReminder(reminder, eventItem, cancellationToken);
+                }
+                else
+                {
+                    store.Write(() =>
+                    {
+                        store.Notifications.Insert(0, new Notification(
+                            Guid.NewGuid(),
+                            reminder.TenantId,
+                            eventItem.ResponsibleUserId,
+                            reminder.Channel,
+                            eventItem.Type.ToString(),
+                            reminder.Message,
+                            NotificationStatus.Sent,
+                            DateTimeOffset.UtcNow,
+                            DateTimeOffset.UtcNow,
+                            null));
+
+                        var index = store.Reminders.FindIndex(r => r.Id == reminder.Id);
+                        store.Reminders[index] = reminder with { Status = NotificationStatus.Sent };
+                        store.Audit(reminder.TenantId, eventItem.ResponsibleUserId, AuditAction.SendNotification, nameof(Reminder), reminder.Id.ToString(), reminder.Message);
+                    });
+                }
+            }
         }
         catch (Exception ex)
         {
             logger.LogError(ex, "Error dispatching reminders.");
         }
+    }
+
+    private async Task DispatchWhatsAppReminder(Reminder reminder, CalendarEvent eventItem, CancellationToken cancellationToken)
+    {
+        var context = store.Read(() =>
+        {
+            var legalCase = eventItem.CaseId.HasValue
+                ? store.Cases.FirstOrDefault(c => c.Id == eventItem.CaseId.Value && c.TenantId == eventItem.TenantId)
+                : null;
+            var client = legalCase?.ClientId is { } clientId
+                ? store.Clients.FirstOrDefault(c => c.Id == clientId && c.TenantId == eventItem.TenantId)
+                : null;
+            return (legalCase, client);
+        });
+
+        if (context.client is null || string.IsNullOrWhiteSpace(context.client.Phone))
+        {
+            MarkReminder(reminder, NotificationStatus.Failed, eventItem.ResponsibleUserId, "Cliente sin telefono para WhatsApp.");
+            return;
+        }
+
+        var clientMessage = BuildClientReminderMessage(context.client, context.legalCase, eventItem, reminder);
+        var result = await openWa.SendMessageAsync(context.client.Phone, clientMessage, cancellationToken);
+        store.Write(() =>
+        {
+            store.WhatsAppMessages.Insert(0, new WhatsAppMessage(
+                Guid.NewGuid(),
+                reminder.TenantId,
+                context.client.Id,
+                context.legalCase?.Id,
+                context.client.Phone,
+                clientMessage,
+                true,
+                result.Success ? "Sent" : result.ProviderStatus,
+                DateTimeOffset.UtcNow,
+                result.Success ? DateTimeOffset.UtcNow : null));
+
+            store.ChatMessages.Insert(0, new ChatMessage(
+                Guid.NewGuid(),
+                reminder.TenantId,
+                context.client.Id,
+                context.legalCase?.Id,
+                ChatDirection.Outbound,
+                NotificationChannel.WhatsApp,
+                eventItem.ResponsibleUserId,
+                "LegalPilot",
+                clientMessage,
+                false,
+                result.Success ? "Sent" : result.ProviderStatus,
+                DateTimeOffset.UtcNow));
+
+            var index = store.Reminders.FindIndex(r => r.Id == reminder.Id);
+            store.Reminders[index] = reminder with { Status = result.Success ? NotificationStatus.Sent : NotificationStatus.Failed };
+            store.Audit(reminder.TenantId, eventItem.ResponsibleUserId, AuditAction.SendWhatsApp, nameof(Reminder), reminder.Id.ToString(), result.Success ? "Recordatorio WhatsApp enviado." : $"Recordatorio WhatsApp fallo: {result.ProviderStatus}.");
+        });
+    }
+
+    private void MarkReminder(Reminder reminder, NotificationStatus status, Guid? actorUserId, string reason)
+    {
+        store.Write(() =>
+        {
+            var index = store.Reminders.FindIndex(r => r.Id == reminder.Id);
+            if (index >= 0)
+            {
+                store.Reminders[index] = reminder with { Status = status };
+            }
+
+            store.Audit(reminder.TenantId, actorUserId, AuditAction.SendNotification, nameof(Reminder), reminder.Id.ToString(), reason);
+        });
+    }
+
+    private static string BuildClientReminderMessage(ClientProfile client, LegalCase? legalCase, CalendarEvent eventItem, Reminder reminder)
+    {
+        var caseText = legalCase is null ? "su caso" : $"el caso {legalCase.CaseNumber}";
+        return $"Estimado/a {client.FullName}, le recordamos {caseText}: {eventItem.Type} programado para {eventItem.StartsAt:yyyy-MM-dd HH:mm}. {reminder.Message}. Si necesita asesoria juridica, un abogado del estudio le contactara.";
     }
 }
 
@@ -1182,28 +1506,32 @@ public sealed class WhatsAppService(LegalPilotStore store, OpenWaClient openWa)
         return message;
     }
 
-    public object ReceiveWebhook(OpenWaWebhookRequest request)
+    public async Task<object> ReceiveWebhookAsync(OpenWaWebhookRequest request, CancellationToken cancellationToken)
     {
         var tenantId = store.Read(() => store.Tenants.First().Id);
-        var body = request.Body ?? string.Empty;
+        var from = request.From ?? request.ChatId ?? "OpenWA";
+        var body = request.Body ?? request.Text ?? string.Empty;
+        var client = ResolveClientByPhone(tenantId, from);
+        var legalCase = ResolveCaseForClient(tenantId, client, body);
+        var assistant = BuildControlledClientReply(tenantId, client, legalCase, body);
         store.Write(() =>
         {
             store.ChatMessages.Insert(0, new ChatMessage(
                 Guid.NewGuid(),
                 tenantId,
-                null,
-                null,
+                client?.Id,
+                legalCase?.Id,
                 ChatDirection.Inbound,
                 NotificationChannel.WhatsApp,
                 null,
-                request.From ?? "OpenWA",
+                from,
                 body,
-                true,
-                "Received",
+                assistant.RequiresHumanReview,
+                assistant.RequiresHumanReview ? "NeedsHumanReview" : "Received",
                 DateTimeOffset.UtcNow));
 
             var lawyer = store.Users.FirstOrDefault(u => u.TenantId == tenantId && u.Roles.Contains(UserRole.Lawyer));
-            if (lawyer is not null)
+            if (lawyer is not null && assistant.RequiresHumanReview)
             {
                 store.Notifications.Insert(0, new Notification(
                     Guid.NewGuid(),
@@ -1218,10 +1546,150 @@ public sealed class WhatsAppService(LegalPilotStore store, OpenWaClient openWa)
                     null));
             }
         });
-        store.Audit(tenantId, null, AuditAction.WebhookReceived, "OpenWA", request.SessionId ?? "default", $"Mensaje OpenWA recibido de {request.From}");
-        return new { received = true, action = "stored-for-routing" };
+
+        string? outboundStatus = null;
+        if (!string.IsNullOrWhiteSpace(assistant.Reply) && client is not null)
+        {
+            var result = await openWa.SendMessageAsync(from, assistant.Reply, cancellationToken);
+            outboundStatus = result.Success ? "Sent" : result.ProviderStatus;
+            store.Write(() =>
+            {
+                store.WhatsAppMessages.Insert(0, new WhatsAppMessage(
+                    Guid.NewGuid(),
+                    tenantId,
+                    client.Id,
+                    legalCase?.Id,
+                    from,
+                    assistant.Reply,
+                    true,
+                    outboundStatus,
+                    DateTimeOffset.UtcNow,
+                    result.Success ? DateTimeOffset.UtcNow : null));
+
+                store.ChatMessages.Insert(0, new ChatMessage(
+                    Guid.NewGuid(),
+                    tenantId,
+                    client.Id,
+                    legalCase?.Id,
+                    ChatDirection.Outbound,
+                    NotificationChannel.WhatsApp,
+                    null,
+                    "LegalPilot",
+                    assistant.Reply,
+                    false,
+                    outboundStatus,
+                    DateTimeOffset.UtcNow));
+            });
+        }
+
+        store.Audit(tenantId, null, AuditAction.WebhookReceived, "OpenWA", request.SessionId ?? "default", $"Mensaje OpenWA recibido de {from}. Accion: {assistant.Action}.");
+        return new { received = true, action = assistant.Action, clientId = client?.Id, caseId = legalCase?.Id, outboundStatus };
     }
 
+    private ClientProfile? ResolveClientByPhone(Guid tenantId, string from)
+    {
+        var incoming = PhoneKey(from);
+        if (string.IsNullOrWhiteSpace(incoming))
+        {
+            return null;
+        }
+
+        return store.Read(() => store.Clients.FirstOrDefault(c =>
+        {
+            var phone = PhoneKey(c.Phone);
+            return phone.Length > 0 && (incoming.EndsWith(phone, StringComparison.Ordinal) || phone.EndsWith(incoming, StringComparison.Ordinal));
+        }));
+    }
+
+    private LegalCase? ResolveCaseForClient(Guid tenantId, ClientProfile? client, string body)
+    {
+        if (client is null)
+        {
+            return null;
+        }
+
+        var caseNumber = store.Read(() => store.Cases
+            .Where(c => c.TenantId == tenantId && c.ClientId == client.Id)
+            .OrderByDescending(c => c.UpdatedAt)
+            .FirstOrDefault(c => body.Contains(c.CaseNumber, StringComparison.OrdinalIgnoreCase))?.CaseNumber);
+
+        return store.Read(() => store.Cases
+            .Where(c => c.TenantId == tenantId && c.ClientId == client.Id)
+            .OrderByDescending(c => c.UpdatedAt)
+            .FirstOrDefault(c => caseNumber is null || c.CaseNumber == caseNumber));
+    }
+
+    private ClientAssistantDecision BuildControlledClientReply(Guid tenantId, ClientProfile? client, LegalCase? legalCase, string body)
+    {
+        if (client is null)
+        {
+            return new ClientAssistantDecision("unknown-client", null, true);
+        }
+
+        var normalized = body.ToLowerInvariant();
+        if (ContainsAny(normalized, "que debo hacer", "que hago", "estrategia", "defensa", "demanda", "sentencia", "apelar", "recurso", "acuerdo"))
+        {
+            return new ClientAssistantDecision("handoff-sensitive", "Recibimos su mensaje. Por tratarse de una consulta que requiere criterio legal, un abogado del estudio le respondera directamente.", true);
+        }
+
+        if (ContainsAny(normalized, "estado", "caso", "proceso", "audiencia", "plazo", "vencimiento"))
+        {
+            var summary = store.Read(() =>
+            {
+                var cases = store.Cases.Where(c => c.TenantId == tenantId && c.ClientId == client.Id).OrderByDescending(c => c.UpdatedAt).ToArray();
+                var selectedCase = legalCase ?? cases.FirstOrDefault();
+                var nextEvent = selectedCase is null
+                    ? null
+                    : store.CalendarEvents.Where(e => e.TenantId == tenantId && e.CaseId == selectedCase.Id && e.StartsAt >= DateTimeOffset.UtcNow).OrderBy(e => e.StartsAt).FirstOrDefault();
+                var nextDeadline = selectedCase is null
+                    ? null
+                    : store.Deadlines.Where(d => d.TenantId == tenantId && d.CaseId == selectedCase.Id && d.Status is DeadlineStatus.Confirmed or DeadlineStatus.PendingReview).OrderBy(d => d.DueDate).FirstOrDefault();
+                return (selectedCase, nextEvent, nextDeadline);
+            });
+
+            if (summary.selectedCase is null)
+            {
+                return new ClientAssistantDecision("client-no-case", $"Estimado/a {client.FullName}, no encontramos un caso activo vinculado a su numero. El equipo revisara su mensaje.", true);
+            }
+
+            var parts = new List<string>
+            {
+                $"Estimado/a {client.FullName}, el caso {summary.selectedCase.CaseNumber} figura como {summary.selectedCase.Status}."
+            };
+            if (summary.nextEvent is not null)
+            {
+                parts.Add($"Proximo evento: {summary.nextEvent.Type} el {summary.nextEvent.StartsAt:yyyy-MM-dd HH:mm}.");
+            }
+
+            if (summary.nextDeadline is not null)
+            {
+                parts.Add($"Proximo plazo registrado: {summary.nextDeadline.DueDate:yyyy-MM-dd} ({summary.nextDeadline.Status}).");
+            }
+
+            parts.Add("Esta es informacion operativa; cualquier decision juridica sera confirmada por el abogado.");
+            return new ClientAssistantDecision("auto-replied-status", string.Join(" ", parts), false);
+        }
+
+        return new ClientAssistantDecision("stored-for-routing", "Recibimos su mensaje. El equipo legal lo revisara y le respondera por este medio.", true);
+    }
+
+    private static bool ContainsAny(string value, params string[] items) => items.Any(value.Contains);
+
+    private static string PhoneKey(string value)
+    {
+        var builder = new StringBuilder();
+        foreach (var c in value)
+        {
+            if (char.IsDigit(c))
+            {
+                builder.Append(c);
+            }
+        }
+
+        return builder.ToString();
+    }
+
+    private sealed record ClientAssistantDecision(string Action, string? Reply, bool RequiresHumanReview);
 }
 
 public sealed class ChatService(LegalPilotStore store)
@@ -1309,13 +1777,14 @@ public sealed record LogoutRequest(string? RefreshToken);
 public sealed record CreateCaseRequest(string Title, string CaseNumber, string Matter, string CourtOrOffice, Guid? ClientId, Guid? ResponsibleUserId);
 public sealed record CreateClientRequest(string FullName, string Email, string Phone, string Identification);
 public sealed record ConnectMailboxRequest(MailProvider Provider, string Email, string? ExternalAccountId);
-public sealed record ManualEmailRequest(MailProvider? Provider, Guid? MailboxConnectionId, Guid? CaseId, string? ExternalMessageId, string Subject, string Sender, string[]? Recipients, string BodyText, string? RawReference, DateTimeOffset? ReceivedAt);
+public sealed record ManualEmailRequest(MailProvider? Provider, Guid? MailboxConnectionId, Guid? CaseId, string? ExternalMessageId, string Subject, string Sender, string[]? Recipients, string BodyText, string? RawReference, DateTimeOffset? ReceivedAt, EmailAttachmentInput[]? Attachments = null);
 public sealed record CreateDeadlineRequest(string Title, Guid? CaseId, DateOnly NotificationDate, int TermDays, string Matter, string? Province, string? Canton, string? RuleCode, Guid? ResponsibleUserId, bool Confirmed);
-public sealed record WebhookEmailEnvelope(string? ExternalMessageId, string Subject, string Sender, string[]? Recipients, string BodyText, string? RawReference, DateTimeOffset? ReceivedAt);
+public sealed record WebhookEmailEnvelope(string? ExternalMessageId, string Subject, string Sender, string[]? Recipients, string BodyText, string? RawReference, DateTimeOffset? ReceivedAt, EmailAttachmentInput[]? Attachments = null);
+public sealed record EmailAttachmentInput(string FileName, string? ContentType, string? ContentBase64, string? TextContent, long? SizeBytes = null);
 public sealed record CreateCalendarEventRequest(Guid? CaseId, CalendarEventType Type, string Title, string? Location, DateTimeOffset StartsAt, DateTimeOffset EndsAt, Guid? ResponsibleUserId, bool RequiresConfirmation);
 public sealed record SendWhatsAppRequest(Guid? ClientId, Guid? CaseId, string? To, string Body, bool Approved);
 public sealed record CreateChatMessageRequest(Guid? ClientId, Guid? CaseId, ChatDirection Direction, NotificationChannel Channel, string Body, bool RequiresHumanReview);
-public sealed record OpenWaWebhookRequest(string? SessionId, string? From, string? Body, string? Event);
+public sealed record OpenWaWebhookRequest(string? SessionId, string? From, string? Body, string? Event, string? ChatId = null, string? Text = null);
 public sealed record GmailWebhookRequest(PubSubMessage Message);
 public sealed record PubSubMessage(string? Data, string? MessageId, Dictionary<string, string>? Attributes);
 

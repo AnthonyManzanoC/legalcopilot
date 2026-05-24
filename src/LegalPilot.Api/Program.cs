@@ -23,6 +23,8 @@ builder.Services.AddSingleton<CaseService>();
 builder.Services.AddSingleton<ClientService>();
 builder.Services.AddSingleton<MailboxService>();
 builder.Services.AddSingleton<OAuthService>();
+builder.Services.Configure<LegalPilotCloudOAuthOptions>(builder.Configuration.GetSection("LegalPilot"));
+builder.Services.AddSingleton<ICloudOAuthWebhookService, CloudOAuthWebhookService>();
 builder.Services.AddSingleton<IEmailConnector, GmailEmailConnector>();
 builder.Services.AddSingleton<IEmailConnector, MicrosoftGraphEmailConnector>();
 builder.Services.AddSingleton<EmailConnectorRegistry>();
@@ -32,6 +34,7 @@ builder.Services.AddSingleton<EcuadorDeadlineEngine>();
 builder.Services.AddSingleton<LegalWorkflowService>();
 builder.Services.AddSingleton<NotificationService>();
 builder.Services.AddSingleton<CalendarService>();
+builder.Services.AddSingleton<ExternalCalendarSyncService>();
 builder.Services.AddSingleton<WhatsAppService>();
 builder.Services.AddSingleton<ChatService>();
 builder.Services.AddSingleton<ReportService>();
@@ -39,6 +42,14 @@ builder.Services.AddHttpClient<OpenWaClient>();
 builder.Services.AddHostedService<ReminderDispatcher>();
 builder.Services.AddHostedService<MailboxSyncWorker>();
 builder.Services.AddHostedService<DeadlineMonitorWorker>();
+builder.Services.AddHostedService<CalendarExternalSyncWorker>();
+builder.Services.AddControllers()
+    .AddJsonOptions(options =>
+    {
+        options.JsonSerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
+        options.JsonSerializerOptions.DictionaryKeyPolicy = JsonNamingPolicy.CamelCase;
+        options.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter());
+    });
 builder.Services.ConfigureHttpJsonOptions(options =>
 {
     options.SerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
@@ -113,6 +124,7 @@ app.MapGet("/health", (LegalPilotStore store) => Results.Ok(new
 }));
 
 app.MapGet("/openapi.json", () => Results.Json(OpenApiContract.Build()));
+app.MapControllers();
 
 app.MapPost("/api/auth/login", (HttpContext context, LoginRequest request, AuthService auth) =>
 {
@@ -294,7 +306,7 @@ app.MapGet("/api/oauth/{provider}/callback", async (string provider, string? sta
     return Results.Content(html, "text/html");
 });
 
-app.MapGet("/api/integrations/status", (HttpRequest request, TokenService tokens, EmailConnectorRegistry connectors, OpenWaClient openWa) =>
+app.MapGet("/api/integrations/status", (HttpRequest request, TokenService tokens, EmailConnectorRegistry connectors, OpenWaClient openWa, ExternalCalendarSyncService calendars) =>
 {
     var principal = HttpAuth.RequirePrincipal(request, tokens);
     HttpAuth.RequireRole(principal, UserRole.SuperAdmin, UserRole.Lawyer, UserRole.Assistant);
@@ -308,7 +320,8 @@ app.MapGet("/api/integrations/status", (HttpRequest request, TokenService tokens
             openWaReadiness.Status,
             openWaReadiness.Message,
             openWaReadiness.RequiredSettings
-        }
+        },
+        calendar = calendars.Status(principal)
     });
 });
 
@@ -318,49 +331,56 @@ app.MapPost("/api/inbox/manual", (HttpRequest request, TokenService tokens, Lega
     return Results.Created("/api/inbox/manual", workflow.IngestManual(principal, payload));
 });
 
-app.MapPost("/api/webhooks/gmail", (HttpRequest request, GmailWebhookRequest payload, LegalWorkflowService workflow, LegalPilotStore store, IConfiguration configuration) =>
+app.MapPost("/api/webhooks/openwa", async (HttpRequest request, WhatsAppService whatsApp, IConfiguration configuration, CancellationToken cancellationToken) =>
 {
-    WebhookSecurity.RequireSharedSecret(request, configuration, "LegalPilot:Gmail:WebhookSecret", "Gmail");
-    var tenantId = store.Read(() => store.Tenants.First().Id);
-    var envelope = WebhookParsers.FromGmailPubSub(payload);
-    var email = workflow.IngestWebhook(tenantId, MailProvider.Gmail, envelope);
-    return Results.Accepted("/api/webhooks/gmail", new { accepted = true, email.Id });
-});
-
-app.MapMethods("/api/webhooks/microsoft", ["GET", "POST"], async (HttpRequest request, LegalWorkflowService workflow, LegalPilotStore store) =>
-{
-    if (request.Query.TryGetValue("validationToken", out var validationToken))
-    {
-        return Results.Text(validationToken.ToString(), "text/plain");
-    }
-
-    using var document = await JsonDocument.ParseAsync(request.Body);
-    WebhookSecurity.RequireMicrosoftClientState(document.RootElement, request.HttpContext.RequestServices.GetRequiredService<IConfiguration>());
-    var tenantId = store.Read(() => store.Tenants.First().Id);
-    var email = workflow.IngestWebhook(tenantId, MailProvider.Outlook, WebhookParsers.FromMicrosoftNotification(document.RootElement));
-    return Results.Accepted("/api/webhooks/microsoft", new { accepted = true, email.Id });
-});
-
-app.MapPost("/api/webhooks/openwa", (HttpRequest request, OpenWaWebhookRequest payload, WhatsAppService whatsApp, IConfiguration configuration) =>
-{
-    var secret = configuration["LegalPilot:OpenWa:WebhookSecret"];
-    if (!string.IsNullOrWhiteSpace(secret))
-    {
-        var supplied = request.Headers["X-OpenWA-Webhook-Secret"].FirstOrDefault()
-            ?? request.Headers["X-Webhook-Secret"].FirstOrDefault();
-        if (!string.Equals(secret, supplied, StringComparison.Ordinal))
-        {
-            throw new UnauthorizedAccessException("Webhook OpenWA no autorizado.");
-        }
-    }
-
-    return Results.Accepted("/api/webhooks/openwa", whatsApp.ReceiveWebhook(payload));
+    using var reader = new StreamReader(request.Body);
+    var rawBody = await reader.ReadToEndAsync(cancellationToken);
+    WebhookSecurity.RequireOpenWaSignatureOrSecret(request, configuration, rawBody);
+    var payload = OpenWaWebhookParser.Parse(rawBody);
+    return Results.Accepted("/api/webhooks/openwa", await whatsApp.ReceiveWebhookAsync(payload, cancellationToken));
 });
 
 app.MapGet("/api/inbox", (HttpRequest request, TokenService tokens, LegalPilotStore store) =>
 {
     var principal = HttpAuth.RequirePrincipal(request, tokens);
-    return Results.Ok(store.Read(() => store.Emails.Where(e => e.TenantId == principal.TenantId).Take(100).ToArray()));
+    return Results.Ok(store.Read(() => store.Emails
+        .Where(e => e.TenantId == principal.TenantId)
+        .OrderByDescending(e => e.ReceivedAt)
+        .Take(100)
+        .Select(e => new
+        {
+            e.Id,
+            e.TenantId,
+            e.MailboxConnectionId,
+            e.CaseId,
+            e.Provider,
+            e.ExternalMessageId,
+            e.Subject,
+            e.Sender,
+            e.Recipients,
+            e.BodyText,
+            e.RawReference,
+            e.ReceivedAt,
+            e.ProcessingStatus,
+            e.Extraction,
+            e.CreatedAt,
+            AttachmentCount = store.Attachments.Count(a => a.LegalEmailId == e.Id && a.TenantId == principal.TenantId)
+        })
+        .ToArray()));
+});
+
+app.MapGet("/api/inbox/{id:guid}/attachments", (HttpRequest request, TokenService tokens, LegalPilotStore store, Guid id) =>
+{
+    var principal = HttpAuth.RequirePrincipal(request, tokens);
+    if (store.Read(() => store.Emails.All(e => e.Id != id || e.TenantId != principal.TenantId)))
+    {
+        throw new KeyNotFoundException("Correo no encontrado.");
+    }
+
+    return Results.Ok(store.Read(() => store.Attachments
+        .Where(a => a.TenantId == principal.TenantId && a.LegalEmailId == id)
+        .OrderBy(a => a.FileName)
+        .ToArray()));
 });
 
 app.MapGet("/api/deadlines", (HttpRequest request, TokenService tokens, LegalPilotStore store) =>
@@ -422,6 +442,12 @@ app.MapPost("/api/calendar/events/{id:guid}/confirm", (HttpRequest request, Toke
 {
     var principal = HttpAuth.RequirePrincipal(request, tokens);
     return Results.Ok(calendar.Confirm(principal, id));
+});
+
+app.MapPost("/api/calendar/events/{id:guid}/sync", async (HttpRequest request, TokenService tokens, ExternalCalendarSyncService calendars, Guid id, CancellationToken cancellationToken) =>
+{
+    var principal = HttpAuth.RequirePrincipal(request, tokens);
+    return Results.Ok(await calendars.SyncEventAsync(principal, id, cancellationToken));
 });
 
 app.MapGet("/api/alerts", (HttpRequest request, TokenService tokens, NotificationService notifications) =>
@@ -525,13 +551,14 @@ app.MapGet("/api/diagnostics", (HttpRequest request, TokenService tokens, LegalP
     }));
 });
 
-app.MapGet("/api/status", (HttpRequest request, TokenService tokens, LegalPilotStore store, EmailConnectorRegistry connectors, OpenWaClient openWa, IConfiguration configuration) =>
+app.MapGet("/api/status", (HttpRequest request, TokenService tokens, LegalPilotStore store, EmailConnectorRegistry connectors, OpenWaClient openWa, ExternalCalendarSyncService calendars, IConfiguration configuration) =>
 {
     var principal = HttpAuth.RequirePrincipal(request, tokens);
     HttpAuth.RequireRole(principal, UserRole.SuperAdmin, UserRole.Lawyer);
     var postgresConfigured = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("LEGALPILOT_DATABASE_URL")) ||
                              !string.IsNullOrWhiteSpace(configuration.GetConnectionString("LegalPilotPostgres")) ||
                              !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("DATABASE_URL"));
+    var calendarStatus = calendars.Status(principal);
 
     return Results.Ok(store.Read(() => new
     {
@@ -568,6 +595,7 @@ app.MapGet("/api/status", (HttpRequest request, TokenService tokens, LegalPilotS
         {
             mail = connectors.Status(),
             openWa = openWa.GetReadiness(),
+            calendar = calendarStatus,
             ai = new
             {
                 provider = configuration["LegalPilot:AI:Provider"] ?? "local-deterministic",
@@ -640,6 +668,12 @@ app.MapPost("/api/ai/feedback", (HttpRequest request, TokenService tokens, Legal
     return Results.Created("/api/ai/feedback", ai.Feedback(principal, payload));
 });
 
+app.MapGet("/api/ai/dataset.jsonl", (HttpRequest request, TokenService tokens, LegalAiPipelineService ai) =>
+{
+    var principal = HttpAuth.RequirePrincipal(request, tokens);
+    return Results.Text(ai.ExportDatasetJsonl(principal), "application/x-jsonlines; charset=utf-8");
+});
+
 app.MapGet("/api/reports/overview", (HttpRequest request, TokenService tokens, ReportService reports) =>
 {
     var principal = HttpAuth.RequirePrincipal(request, tokens);
@@ -693,6 +727,10 @@ static class OpenApiContract
             ["/api/auth/logout"] = Path("post", "Revocacion de sesion"),
             ["/api/auth/forgot-password"] = Path("post", "Inicio de recuperacion de contrasena"),
             ["/api/auth/reset-password"] = Path("post", "Cambio de contrasena con token"),
+            ["/api/auth/gmail/login"] = Path("get", "Iniciar OAuth Gmail y redirigir al consentimiento"),
+            ["/api/auth/gmail/callback"] = Path("get", "Callback OAuth Gmail, exchange token y users.watch"),
+            ["/api/auth/microsoft/login"] = Path("get", "Iniciar OAuth Microsoft y redirigir al consentimiento"),
+            ["/api/auth/microsoft/callback"] = Path("get", "Callback OAuth Microsoft, MSAL y Graph subscriptions"),
             ["/api/me"] = Path("get", "Perfil autenticado"),
             ["/api/users"] = Path("get", "Usuarios del tenant"),
             ["/api/cases"] = Path("get", "Listado de casos", "post", "Crear caso"),
@@ -704,11 +742,13 @@ static class OpenApiContract
             ["/api/oauth/start"] = Path("post", "Iniciar OAuth Gmail/Microsoft"),
             ["/api/oauth/{provider}/callback"] = Path("get", "Callback OAuth con exchange y token cifrado"),
             ["/api/inbox"] = Path("get", "Inbox legal procesado"),
+            ["/api/inbox/{id}/attachments"] = Path("get", "Adjuntos normalizados de un correo"),
             ["/api/inbox/manual"] = Path("post", "Ingesta manual de correo legal"),
             ["/api/deadlines"] = Path("get", "Plazos", "post", "Crear plazo deterministico"),
             ["/api/deadlines/calculate"] = Path("post", "Calcular plazo Ecuador sin LLM"),
             ["/api/calendar/events"] = Path("get", "Eventos", "post", "Crear evento"),
             ["/api/alerts"] = Path("get", "Alertas"),
+            ["/api/calendar/events/{id}/sync"] = Path("post", "Sincronizar evento confirmado con Google/Outlook Calendar"),
             ["/api/chat/messages"] = Path("get", "Mensajes", "post", "Crear mensaje"),
             ["/api/whatsapp/messages"] = Path("get", "WhatsApp enviados"),
             ["/api/whatsapp/send-client-message"] = Path("post", "Enviar WhatsApp por OpenWA"),
@@ -716,6 +756,7 @@ static class OpenApiContract
             ["/api/ai/analyze"] = Path("post", "Clasificacion y extraccion asistida sin calculo de plazos"),
             ["/api/ai/knowledge"] = Path("post", "Registrar fuente para RAG"),
             ["/api/ai/feedback"] = Path("post", "Guardar correccion humana para entrenamiento"),
+            ["/api/ai/dataset.jsonl"] = Path("get", "Exportar dataset JSONL para entrenamiento/fine-tuning ligero"),
             ["/api/audit"] = Path("get", "Bitacora auditada"),
             ["/api/status"] = Path("get", "Diagnostico operativo autenticado"),
             ["/api/webhooks/gmail"] = Path("post", "Webhook Gmail Pub/Sub"),
@@ -750,5 +791,42 @@ static class OpenApiContract
         }
 
         return map;
+    }
+}
+
+static class OpenWaWebhookParser
+{
+    public static OpenWaWebhookRequest Parse(string rawBody)
+    {
+        if (string.IsNullOrWhiteSpace(rawBody))
+        {
+            return new OpenWaWebhookRequest(null, null, null, "empty");
+        }
+
+        using var document = JsonDocument.Parse(rawBody);
+        var root = document.RootElement;
+        var data = root.TryGetProperty("data", out var dataElement) && dataElement.ValueKind == JsonValueKind.Object
+            ? dataElement
+            : root;
+        var message = data.TryGetProperty("message", out var messageElement) && messageElement.ValueKind == JsonValueKind.Object
+            ? messageElement
+            : data;
+
+        return new OpenWaWebhookRequest(
+            Get(root, "sessionId") ?? Get(data, "sessionId") ?? Get(root, "session") ?? Get(data, "session"),
+            Get(root, "from") ?? Get(data, "from") ?? Get(message, "from") ?? Get(root, "chatId") ?? Get(data, "chatId"),
+            Get(root, "body") ?? Get(data, "body") ?? Get(message, "body") ?? Get(message, "text") ?? Get(root, "text"),
+            Get(root, "event") ?? Get(root, "type") ?? Get(data, "event") ?? "message",
+            Get(root, "chatId") ?? Get(data, "chatId") ?? Get(message, "chatId"),
+            Get(root, "text") ?? Get(data, "text") ?? Get(message, "text"));
+    }
+
+    private static string? Get(JsonElement element, string property)
+    {
+        return element.ValueKind == JsonValueKind.Object &&
+               element.TryGetProperty(property, out var value) &&
+               value.ValueKind is JsonValueKind.String or JsonValueKind.Number
+            ? value.ToString()
+            : null;
     }
 }

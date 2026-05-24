@@ -286,7 +286,13 @@ const loadIntegrations = async () => {
     item.status
   )).join("");
   const openWa = itemTemplate("OpenWA", status.openWa.status, status.openWa.requiredSettings.join(", "), status.openWa.status);
-  $("#integrationStatus").innerHTML = mail + openWa;
+  const calendar = status.calendar ? itemTemplate(
+    "Calendario externo",
+    status.calendar.status,
+    `${status.calendar.confirmedUnsyncedEvents ?? 0} eventos confirmados pendientes de sync. Proveedor: ${status.calendar.preferredProvider || "auto"}.`,
+    status.calendar.configured ? "Configured" : status.calendar.status
+  ) : "";
+  $("#integrationStatus").innerHTML = mail + openWa + calendar;
   $("#syncStates").innerHTML = syncStates.length ? syncStates.slice(0, 8).map((entry) => itemTemplate(
     `${entry.provider} sync`,
     formatDateTime(entry.checkedAt),
@@ -402,8 +408,11 @@ const loadCalendar = async () => {
         <span class="tag ${event.confirmed ? "ok" : ""}">${escapeHtml(event.type)}</span>
       </div>
       <span>${formatDateTime(event.startsAt)} - ${event.confirmed ? "Confirmado" : "Pendiente"}</span>
-      <p>${escapeHtml(event.location || "Sin ubicacion")}</p>
-      ${event.confirmed ? "" : `<button class="compact fit" data-confirm-event="${event.id}">Confirmar</button>`}
+      <p>${escapeHtml(event.location || "Sin ubicacion")} ${event.externalEventId ? `- externo: ${escapeHtml(event.externalProvider)}` : ""}</p>
+      <div class="actions">
+        ${event.confirmed ? "" : `<button class="compact fit" data-confirm-event="${event.id}">Confirmar</button>`}
+        ${event.confirmed && !event.externalEventId ? `<button class="compact ghost inline" data-sync-event="${event.id}">Sincronizar externo</button>` : ""}
+      </div>
     </article>
   `).join("") : `<p class="muted">No hay eventos.</p>`;
 };
@@ -679,17 +688,14 @@ $("#oauthStartBtn").addEventListener("click", async () => {
   const button = $("#oauthStartBtn");
   setLoading(button, true);
   try {
-    const result = await api("/api/oauth/start", {
-      method: "POST",
-      body: JSON.stringify({
-        provider: form.get("provider"),
-        email: form.get("email")
-      })
-    });
+    const provider = form.get("provider") === "Gmail" ? "gmail" : "microsoft";
+    const email = encodeURIComponent(form.get("email"));
+    const result = await api(`/api/auth/${provider}/login?email=${email}&mode=json`, { method: "GET" });
 
     $("#oauthBox").innerHTML = `
       <strong>OAuth listo para ${escapeHtml(result.provider)}</strong>
       <span>Estado expira: ${formatDateTime(result.expiresAt)}</span>
+      <span>El callback creara automaticamente el webhook del proveedor.</span>
       <a href="${escapeHtml(result.authorizationUrl)}" target="_blank" rel="noreferrer">Abrir autorizacion del proveedor</a>
     `;
     $("#oauthBox").className = "oauth-box";
@@ -833,6 +839,7 @@ document.addEventListener("click", async (event) => {
   const review = event.target.closest("[data-review-deadline]");
   const ack = event.target.closest("[data-ack-alert]");
   const confirm = event.target.closest("[data-confirm-event]");
+  const syncEvent = event.target.closest("[data-sync-event]");
   const sync = event.target.closest("[data-sync-mailbox]");
 
   try {
@@ -855,6 +862,12 @@ document.addEventListener("click", async (event) => {
       await api(`/api/calendar/events/${confirm.dataset.confirmEvent}/confirm`, { method: "POST" });
       await Promise.all([loadCalendar(), loadOverview()]);
       showToast("Evento confirmado.");
+    }
+
+    if (syncEvent) {
+      await api(`/api/calendar/events/${syncEvent.dataset.syncEvent}/sync`, { method: "POST" });
+      await Promise.all([loadCalendar(), loadIntegrations(), loadSystemStatus()]);
+      showToast("Sincronizacion externa intentada.");
     }
 
     if (sync) {

@@ -1,5 +1,6 @@
 using LegalPilot.Api.Domain;
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using LegalPilot.Api.Application;
@@ -132,7 +133,7 @@ public sealed class GmailEmailConnector(
             }
 
             using var detailDocument = JsonDocument.Parse(detailPayload);
-            var envelope = GmailMessageToEnvelope(id, detailDocument.RootElement);
+            var envelope = await GmailMessageToEnvelopeAsync(access.Token!, id, detailDocument.RootElement, cancellationToken);
             workflow.IngestWebhook(mailbox.TenantId, Provider, envelope);
             ingested++;
         }
@@ -216,13 +217,14 @@ public sealed class GmailEmailConnector(
         return EmailConnectorHelpers.ParseRefreshedToken(payload);
     }
 
-    private WebhookEmailEnvelope GmailMessageToEnvelope(string id, JsonElement root)
+    private async Task<WebhookEmailEnvelope> GmailMessageToEnvelopeAsync(string accessToken, string id, JsonElement root, CancellationToken cancellationToken)
     {
         var payload = root.TryGetProperty("payload", out var payloadElement) ? payloadElement : default;
         var subject = Header(payload, "Subject") ?? "(sin asunto)";
         var sender = Header(payload, "From") ?? "gmail";
         var recipients = EmailConnectorHelpers.SplitRecipients(Header(payload, "To"));
         var body = ExtractGmailBody(payload);
+        var attachments = await ExtractGmailAttachmentsAsync(accessToken, id, payload, cancellationToken);
         if (string.IsNullOrWhiteSpace(body) && root.TryGetProperty("snippet", out var snippet))
         {
             body = snippet.GetString() ?? string.Empty;
@@ -235,7 +237,7 @@ public sealed class GmailEmailConnector(
             receivedAt = DateTimeOffset.FromUnixTimeMilliseconds(milliseconds);
         }
 
-        return new WebhookEmailEnvelope(id, subject, sender, recipients, string.IsNullOrWhiteSpace(body) ? subject : body, "gmail-api", receivedAt);
+        return new WebhookEmailEnvelope(id, subject, sender, recipients, string.IsNullOrWhiteSpace(body) ? subject : body, "gmail-api", receivedAt, attachments);
     }
 
     private static string? Header(JsonElement payload, string name)
@@ -294,6 +296,78 @@ public sealed class GmailEmailConnector(
         return string.Empty;
     }
 
+    private async Task<EmailAttachmentInput[]> ExtractGmailAttachmentsAsync(string accessToken, string messageId, JsonElement payload, CancellationToken cancellationToken)
+    {
+        var attachments = new List<EmailAttachmentInput>();
+        await Visit(payload);
+        return attachments.ToArray();
+
+        async Task Visit(JsonElement part)
+        {
+            if (part.ValueKind == JsonValueKind.Undefined)
+            {
+                return;
+            }
+
+            var fileName = part.TryGetProperty("filename", out var filenameElement)
+                ? filenameElement.GetString()
+                : null;
+            var mimeType = part.TryGetProperty("mimeType", out var mimeElement)
+                ? mimeElement.GetString()
+                : "application/octet-stream";
+
+            if (!string.IsNullOrWhiteSpace(fileName) && part.TryGetProperty("body", out var body))
+            {
+                var size = body.TryGetProperty("size", out var sizeElement) && sizeElement.TryGetInt64(out var parsedSize)
+                    ? parsedSize
+                    : 0;
+                var data = body.TryGetProperty("data", out var dataElement)
+                    ? EmailConnectorHelpers.DecodeBase64UrlBytes(dataElement.GetString())
+                    : null;
+                if (data is null && body.TryGetProperty("attachmentId", out var attachmentIdElement))
+                {
+                    var attachmentId = attachmentIdElement.GetString();
+                    if (!string.IsNullOrWhiteSpace(attachmentId))
+                    {
+                        data = await DownloadGmailAttachmentAsync(accessToken, messageId, attachmentId, cancellationToken);
+                    }
+                }
+
+                if (data is not null)
+                {
+                    attachments.Add(new EmailAttachmentInput(fileName, mimeType, Convert.ToBase64String(data), null, size));
+                }
+            }
+
+            if (part.TryGetProperty("parts", out var parts))
+            {
+                foreach (var child in parts.EnumerateArray())
+                {
+                    await Visit(child);
+                }
+            }
+        }
+    }
+
+    private async Task<byte[]?> DownloadGmailAttachmentAsync(string accessToken, string messageId, string attachmentId, CancellationToken cancellationToken)
+    {
+        var client = httpClientFactory.CreateClient("gmail");
+        using var request = new HttpRequestMessage(HttpMethod.Get, $"https://gmail.googleapis.com/gmail/v1/users/me/messages/{Uri.EscapeDataString(messageId)}/attachments/{Uri.EscapeDataString(attachmentId)}");
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+        using var response = await client.SendAsync(request, cancellationToken);
+        var payload = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            logger.LogWarning("Gmail attachment.get failed for message {MessageId} attachment {AttachmentId} with {Status}.", messageId, attachmentId, response.StatusCode);
+            return null;
+        }
+
+        using var document = JsonDocument.Parse(payload);
+        return document.RootElement.TryGetProperty("data", out var data)
+            ? EmailConnectorHelpers.DecodeBase64UrlBytes(data.GetString())
+            : null;
+    }
+
     private string[] Missing(params string[] keys)
     {
         return keys.Where(key => string.IsNullOrWhiteSpace(configuration[key])).ToArray();
@@ -319,7 +393,7 @@ public sealed class MicrosoftGraphEmailConnector(
 
     public IntegrationReadiness GetReadiness()
     {
-        var missing = Missing("LegalPilot:Microsoft:ClientId", "LegalPilot:Microsoft:ClientSecret", "LegalPilot:Microsoft:TenantId", "LegalPilot:Microsoft:RedirectUri");
+        var missing = Missing("LegalPilot:Microsoft:ClientId", "LegalPilot:Microsoft:ClientSecret", "LegalPilot:Microsoft:RedirectUri");
         if (!secretProtector.Configured)
         {
             missing = [.. missing, "LEGALPILOT_DATA_PROTECTION_KEY"];
@@ -381,7 +455,7 @@ public sealed class MicrosoftGraphEmailConnector(
                 continue;
             }
 
-            workflow.IngestWebhook(mailbox.TenantId, Provider, GraphMessageToEnvelope(id, item));
+            workflow.IngestWebhook(mailbox.TenantId, Provider, await GraphMessageToEnvelopeAsync(access.Token!, id, item, cancellationToken));
             ingested++;
         }
 
@@ -466,7 +540,7 @@ public sealed class MicrosoftGraphEmailConnector(
         return EmailConnectorHelpers.ParseRefreshedToken(payload);
     }
 
-    private static WebhookEmailEnvelope GraphMessageToEnvelope(string id, JsonElement item)
+    private async Task<WebhookEmailEnvelope> GraphMessageToEnvelopeAsync(string accessToken, string id, JsonElement item, CancellationToken cancellationToken)
     {
         var subject = item.TryGetProperty("subject", out var subjectElement) ? subjectElement.GetString() ?? "(sin asunto)" : "(sin asunto)";
         var sender = "microsoft-graph";
@@ -506,7 +580,55 @@ public sealed class MicrosoftGraphEmailConnector(
             ? parsed
             : DateTimeOffset.UtcNow;
 
-        return new WebhookEmailEnvelope(id, subject, sender, recipients.ToArray(), string.IsNullOrWhiteSpace(body) ? subject : body, "microsoft-graph-api", receivedAt);
+        var attachments = await ExtractGraphAttachmentsAsync(accessToken, id, cancellationToken);
+        return new WebhookEmailEnvelope(id, subject, sender, recipients.ToArray(), string.IsNullOrWhiteSpace(body) ? subject : body, "microsoft-graph-api", receivedAt, attachments);
+    }
+
+    private async Task<EmailAttachmentInput[]> ExtractGraphAttachmentsAsync(string accessToken, string messageId, CancellationToken cancellationToken)
+    {
+        var client = httpClientFactory.CreateClient("graph");
+        using var request = new HttpRequestMessage(HttpMethod.Get, $"https://graph.microsoft.com/v1.0/me/messages/{Uri.EscapeDataString(messageId)}/attachments?$select=id,name,contentType,size,isInline,contentBytes");
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+        using var response = await client.SendAsync(request, cancellationToken);
+        var payload = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            logger.LogWarning("Graph attachments failed for message {MessageId} with {Status}.", messageId, response.StatusCode);
+            return [];
+        }
+
+        using var document = JsonDocument.Parse(string.IsNullOrWhiteSpace(payload) ? "{}" : payload);
+        if (!document.RootElement.TryGetProperty("value", out var items))
+        {
+            return [];
+        }
+
+        var attachments = new List<EmailAttachmentInput>();
+        foreach (var item in items.EnumerateArray())
+        {
+            var isInline = item.TryGetProperty("isInline", out var inlineElement) && inlineElement.ValueKind == JsonValueKind.True;
+            if (isInline)
+            {
+                continue;
+            }
+
+            var name = item.TryGetProperty("name", out var nameElement) ? nameElement.GetString() : null;
+            var contentBytes = item.TryGetProperty("contentBytes", out var bytesElement) ? bytesElement.GetString() : null;
+            if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(contentBytes))
+            {
+                continue;
+            }
+
+            var contentType = item.TryGetProperty("contentType", out var contentTypeElement)
+                ? contentTypeElement.GetString()
+                : "application/octet-stream";
+            var size = item.TryGetProperty("size", out var sizeElement) && sizeElement.TryGetInt64(out var parsedSize)
+                ? parsedSize
+                : null as long?;
+            attachments.Add(new EmailAttachmentInput(name, contentType, contentBytes, null, size));
+        }
+
+        return attachments.ToArray();
     }
 
     private string[] Missing(params string[] keys)
@@ -564,6 +686,44 @@ public static class WebhookSecurity
             }
         }
     }
+
+    public static void RequireOpenWaSignatureOrSecret(HttpRequest request, IConfiguration configuration, string rawBody)
+    {
+        var expected = configuration["LegalPilot:OpenWa:WebhookSecret"];
+        if (string.IsNullOrWhiteSpace(expected))
+        {
+            return;
+        }
+
+        var signature = request.Headers["X-OpenWA-Signature"].FirstOrDefault()
+            ?? request.Headers["X-Hub-Signature-256"].FirstOrDefault();
+        if (!string.IsNullOrWhiteSpace(signature))
+        {
+            var normalized = signature.StartsWith("sha256=", StringComparison.OrdinalIgnoreCase)
+                ? signature["sha256=".Length..]
+                : signature;
+            using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(expected));
+            var computed = Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(rawBody))).ToLowerInvariant();
+            if (FixedTimeEquals(computed, normalized.ToLowerInvariant()))
+            {
+                return;
+            }
+        }
+
+        var supplied = request.Headers["X-OpenWA-Webhook-Secret"].FirstOrDefault()
+            ?? request.Headers["X-Webhook-Secret"].FirstOrDefault();
+        if (!string.Equals(expected, supplied, StringComparison.Ordinal))
+        {
+            throw new UnauthorizedAccessException("Webhook OpenWA no autorizado.");
+        }
+    }
+
+    private static bool FixedTimeEquals(string expected, string supplied)
+    {
+        var left = Encoding.UTF8.GetBytes(expected);
+        var right = Encoding.UTF8.GetBytes(supplied);
+        return left.Length == right.Length && CryptographicOperations.FixedTimeEquals(left, right);
+    }
 }
 
 internal sealed record TokenResolution(bool Success, string Status, string Message, string? Token);
@@ -615,6 +775,18 @@ internal static class EmailConnectorHelpers
         var padded = data.Replace('-', '+').Replace('_', '/');
         padded = padded.PadRight(padded.Length + (4 - padded.Length % 4) % 4, '=');
         return Encoding.UTF8.GetString(Convert.FromBase64String(padded));
+    }
+
+    public static byte[] DecodeBase64UrlBytes(string? data)
+    {
+        if (string.IsNullOrWhiteSpace(data))
+        {
+            return [];
+        }
+
+        var padded = data.Replace('-', '+').Replace('_', '/');
+        padded = padded.PadRight(padded.Length + (4 - padded.Length % 4) % 4, '=');
+        return Convert.FromBase64String(padded);
     }
 
     public static string[] SplitRecipients(string? value)

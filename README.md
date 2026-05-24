@@ -12,10 +12,11 @@ LegalPilot Ecuador es un monolito modular ASP.NET Core para operar inbox legal, 
 - Fallback local durable en JSON atomico solo para desarrollo/pruebas sin base externa.
 - Migracion automatica desde JSON a PostgreSQL si la base esta vacia.
 - Motor deterministico de plazos Ecuador con sabados, domingos, feriados, feriados trasladados y excepciones de dia habil.
-- Ingesta manual de correos, webhooks Gmail/Microsoft, OAuth con exchange de token y clasificacion legal auditable.
-- Creacion automatica de plazos, eventos, recordatorios, alertas y bitacora.
+- Ingesta manual de correos, webhooks Gmail/Microsoft, OAuth con exchange de token, `users.watch` Gmail y suscripciones Graph.
+- Normalizacion de adjuntos con hash, persistencia y OCR/text extraction basico para texto/PDF/imagenes con punto de extension OCR real.
+- Creacion automatica de plazos, eventos, recordatorios, alertas, sincronizacion Google/Outlook Calendar para eventos confirmados y bitacora.
 - Chat interno/WhatsApp auditado.
-- OpenWA no simula envios: si faltan credenciales queda `ProviderNotConfigured`.
+- OpenWA no simula envios: si faltan credenciales queda `ProviderNotConfigured`; el asistente de cliente responde solo estados operativos y deriva temas sensibles.
 - Worker en segundo plano para recordatorios, revision de buzones registrados y plazos vencidos.
 - Pipeline IA/RAG preparado con fuentes de conocimiento, ejecuciones auditadas, feedback para fine-tuning ligero y guardrail estricto: la IA no calcula vencimientos.
 - Pruebas smoke sin dependencias externas.
@@ -90,9 +91,10 @@ Variables principales:
 - `ConnectionStrings__LegalPilotPostgres`: alternativa a `LEGALPILOT_DATABASE_URL` desde Secret Manager/configuracion protegida.
 - `LEGALPILOT_BOOTSTRAP_ADMIN_EMAIL`, `LEGALPILOT_BOOTSTRAP_ADMIN_PASSWORD`: primer usuario si la base productiva esta vacia.
 - `LegalPilot__Storage__Path`: ruta del snapshot durable local y origen de migracion JSON si PostgreSQL esta vacio.
-- `LegalPilot__Gmail__ClientId`, `ClientSecret`, `RedirectUri`: credenciales OAuth Gmail.
-- `LegalPilot__Microsoft__ClientId`, `ClientSecret`, `TenantId`, `RedirectUri`: credenciales Microsoft Graph.
-- `LegalPilot__OpenWa__BaseUrl`, `ApiKey`, `WebhookSecret`: servicio OpenWA.
+- `LegalPilot__Gmail__ClientId`, `ClientSecret`, `RedirectUri`, `PubSubTopicName`, `WebhookSecret`: credenciales OAuth Gmail y topic Pub/Sub.
+- `LegalPilot__Microsoft__ClientId`, `ClientSecret`, `TenantId`, `RedirectUri`, `WebhookClientState`, `WebhookNotificationUrl`: credenciales Microsoft Graph y webhook.
+- `LegalPilot__OpenWa__BaseUrl`, `ApiKey`, `SessionId`, `WebhookSecret`: servicio OpenWA.
+- `LegalPilot__Calendar__PreferredProvider`: `auto`, `Gmail` u `Outlook` para sincronizacion externa.
 - `LegalPilot__AI__Provider`, `Model`, `EmbeddingModel`, `ApiKey`: proveedor IA/RAG cuando se conecte un gateway LLM.
 
 ## Endpoints principales
@@ -103,6 +105,10 @@ Variables principales:
 - `POST /api/auth/logout`
 - `POST /api/auth/forgot-password`
 - `POST /api/auth/reset-password`
+- `GET /api/auth/gmail/login`
+- `GET /api/auth/gmail/callback`
+- `GET /api/auth/microsoft/login`
+- `GET /api/auth/microsoft/callback`
 - `GET /api/me`
 - `GET /api/users`
 - `GET|POST /api/cases`
@@ -115,6 +121,7 @@ Variables principales:
 - `GET /api/mailboxes/sync-states`
 - `GET /api/integrations/status`
 - `POST /api/inbox/manual`
+- `GET /api/inbox/{id}/attachments`
 - `POST /api/webhooks/gmail`
 - `GET|POST /api/webhooks/microsoft`
 - `POST /api/webhooks/openwa`
@@ -123,6 +130,7 @@ Variables principales:
 - `PATCH /api/deadlines/{id}/review`
 - `GET|POST /api/calendar/events`
 - `POST /api/calendar/events/{id}/confirm`
+- `POST /api/calendar/events/{id}/sync`
 - `GET /api/reminders`
 - `GET /api/alerts`
 - `POST /api/alerts/{id}/ack`
@@ -141,14 +149,15 @@ Variables principales:
 - `POST /api/ai/analyze`
 - `POST /api/ai/knowledge`
 - `POST /api/ai/feedback`
+- `GET /api/ai/dataset.jsonl`
 - `POST /api/oauth/start`
 - `GET /api/oauth/{provider}/callback`
 
 ## Integraciones
 
-Gmail y Microsoft Graph tienen inicio OAuth real, `state` temporal, callback validado, exchange de token, almacenamiento cifrado con `LEGALPILOT_DATA_PROTECTION_KEY`, refresh token y sincronizacion inicial de mensajes (`messages.get` / Graph `/me/messages`). Sin credenciales quedan marcados como `ConfigurationMissing`.
+Gmail y Microsoft Graph tienen inicio OAuth real por controllers (`/api/auth/gmail/login` y `/api/auth/microsoft/login`), `state` temporal, callback validado, exchange de token con `Google.Apis.Auth` y MSAL, almacenamiento cifrado con `LEGALPILOT_DATA_PROTECTION_KEY`, refresh token, creacion inmediata de webhook (`users.watch` con Pub/Sub y Graph `/subscriptions`) y sincronizacion inicial de mensajes (`messages.get` / Graph `/me/messages`). Sin credenciales quedan marcados como `ConfigurationMissing`.
 
-OpenWA usa `LegalPilot:OpenWa:BaseUrl` y `ApiKey`. Si faltan, los mensajes quedan fallidos con `ProviderNotConfigured`; no se reportan como enviados.
+OpenWA usa `LegalPilot:OpenWa:BaseUrl`, `ApiKey`, `SessionId` y `WebhookSecret`. Si faltan, los mensajes quedan fallidos con `ProviderNotConfigured`; no se reportan como enviados.
 
 ## Persistencia y PostgreSQL
 
@@ -165,12 +174,12 @@ Detalle operativo: [docs/database.md](docs/database.md).
 5. Revisar Calendario y Recordatorios generados.
 6. Confirmar alerta/evento o aprobar/cancelar plazo.
 7. Crear cliente/caso manual.
-8. Registrar buzon en Integraciones y revisar estado OAuth/configuracion.
+8. Registrar buzon en Integraciones e iniciar OAuth seguro; el callback crea webhook Gmail/Graph.
 9. En Chat, registrar mensaje o intentar envio OpenWA.
 10. Revisar Auditoria.
 
 ## Limites operativos honestos
 
-- Gmail Pub/Sub `history.list`, Graph delta query, OCR de adjuntos y almacenamiento documental completo quedan como extensiones siguientes; el contrato y los puntos de extension ya estan listos.
+- Gmail Pub/Sub activa `users.watch`; la sincronizacion directa ya descarga mensajes recientes y adjuntos. `history.list`, Graph delta query, OCR avanzado y object storage documental quedan como extensiones siguientes.
 - La capa IA actual registra fuentes RAG, ejecuciones y feedback; si no hay gateway LLM configurado usa clasificacion deterministica local.
 - No hay MFA ni KMS administrado; use Secret Manager/variables protegidas y agregue MFA antes de datos sensibles reales.

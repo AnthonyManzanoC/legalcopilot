@@ -11,7 +11,8 @@
 7. Revise Estado del sistema: debe indicar `PostgreSQL activo` cuando Supabase este configurado.
 8. Procese un correo demo.
 9. Confirme que se crearon inbox, plazo, calendario, recordatorios y auditoria.
-10. Ejecute `dotnet run --project src/LegalPilot.Tests/LegalPilot.Tests.csproj`.
+10. Registre un buzon en Integraciones y pulse OAuth seguro; el link usa `/api/auth/{provider}/login`.
+11. Ejecute `dotnet run --project src/LegalPilot.Tests/LegalPilot.Tests.csproj`.
 
 ## Gmail
 
@@ -20,20 +21,23 @@ Configuracion requerida:
 - `LegalPilot:Gmail:ClientId`
 - `LegalPilot:Gmail:ClientSecret`
 - `LegalPilot:Gmail:RedirectUri`
+- `LegalPilot:Gmail:PubSubTopicName`
+- `LegalPilot:Gmail:WebhookSecret`
 - `LEGALPILOT_DATA_PROTECTION_KEY`
 
-Punto de extension:
+Flujo implementado:
 
+- `GET /api/auth/gmail/login?email=...` inicia OAuth y redirige a Google.
+- `GET /api/auth/gmail/callback` intercambia `code` con `Google.Apis.Auth`, guarda tokens cifrados y llama `users.watch`.
+- `users.watch` usa el topic `projects/legalcopilot-497022/topics/notificaciones-gmail` salvo override por variable.
+- `POST /api/webhooks/gmail` valida secreto, intenta sincronizar el buzon real y si no existe guarda la notificacion como entrada auditada.
 - `Infrastructure/GmailEmailConnector.SyncAsync`
 - `POST /api/webhooks/gmail`
 
 Pendiente para produccion:
 
-- OAuth callback con exchange de token.
-- Guardar refresh token cifrado.
-- `messages.list` y `messages.get` para sincronizacion directa.
-- `users.watch` con Pub/Sub para notificaciones.
-- `history.list` y `attachments.get` para sincronizacion incremental y adjuntos.
+- Crear el topic Pub/Sub en Google Cloud y conceder a Gmail permisos de publicacion.
+- Agregar `history.list` para sincronizacion incremental exacta desde `historyId`.
 - Renovacion de watch antes de expirar.
 
 ## Microsoft Graph / Outlook / Hotmail
@@ -42,23 +46,39 @@ Configuracion requerida:
 
 - `LegalPilot:Microsoft:ClientId`
 - `LegalPilot:Microsoft:ClientSecret`
-- `LegalPilot:Microsoft:TenantId`
+- `LegalPilot:Microsoft:TenantId` opcional; default `common`
 - `LegalPilot:Microsoft:RedirectUri`
 - `LEGALPILOT_DATA_PROTECTION_KEY`
-- `LegalPilot:Microsoft:WebhookClientState` si se usa webhook Graph.
+- `LegalPilot:Microsoft:WebhookClientState`
+- `LegalPilot:Microsoft:WebhookNotificationUrl`
 
-Punto de extension:
+Flujo implementado:
 
+- `GET /api/auth/microsoft/login?email=...` inicia OAuth y redirige a Microsoft.
+- `GET /api/auth/microsoft/callback` intercambia `code` con MSAL, guarda tokens cifrados y crea suscripcion Graph.
+- `POST /api/webhooks/microsoft` devuelve `validationToken` en texto plano cuando Graph valida la URL.
+- Las notificaciones reales validan `clientState` antes de sincronizar.
 - `Infrastructure/MicrosoftGraphEmailConnector.SyncAsync`
 - `GET|POST /api/webhooks/microsoft`
 
 Pendiente para produccion:
 
-- OAuth callback con exchange de token.
-- Validar `clientState`.
-- Subscriptions para change notifications.
 - Delta query para recuperacion de fallos.
-- Almacenamiento cifrado de tokens.
+- Renovar subscriptions antes de `expirationDateTime`.
+
+## Calendario externo
+
+Configuracion requerida:
+
+- OAuth Gmail con scope `calendar.events` o Microsoft con scope `Calendars.ReadWrite`.
+- `LegalPilot:Calendar:PreferredProvider` opcional: `auto`, `Gmail` u `Outlook`.
+
+Comportamiento:
+
+- Solo sincroniza eventos confirmados por abogado.
+- `POST /api/calendar/events/{id}/sync` intenta crear el evento en Google Calendar u Outlook Calendar.
+- `CalendarExternalSyncWorker` revisa eventos confirmados sin `ExternalEventId`.
+- Si no hay token OAuth, queda `OAuthCalendarNotConnected`; no se simula exito.
 
 ## OpenWA
 
@@ -66,6 +86,7 @@ Configuracion requerida:
 
 - `LegalPilot:OpenWa:BaseUrl`
 - `LegalPilot:OpenWa:ApiKey`
+- `LegalPilot:OpenWa:SessionId`
 - `LegalPilot:OpenWa:WebhookSecret`
 
 Punto de extension:
@@ -76,8 +97,16 @@ Punto de extension:
 Comportamiento actual:
 
 - Si falta `BaseUrl` o `ApiKey`, el envio queda `ProviderNotConfigured`.
-- Si `WebhookSecret` esta configurado, `/api/webhooks/openwa` exige `X-OpenWA-Webhook-Secret` o `X-Webhook-Secret`.
-- Todo mensaje entrante crea `ChatMessage`, alerta al abogado y registra auditoria.
+- Si `SessionId` existe, el envio usa `/api/sessions/{sessionId}/messages/send-text`; sin `SessionId` conserva fallback `/api/messages/send`.
+- Si `WebhookSecret` esta configurado, `/api/webhooks/openwa` acepta HMAC `X-OpenWA-Signature`/`X-Hub-Signature-256` o secreto compartido.
+- Todo mensaje entrante crea `ChatMessage`, alerta al abogado si requiere revision y registra auditoria.
+- El asistente solo contesta estado operativo, proximo evento/plazo y deriva asuntos sensibles al abogado.
+
+## IA y entrenamiento futuro
+
+- `GET /api/ai/dataset.jsonl` exporta ejemplos instruccion/input/output para clasificacion y extraccion.
+- El dataset es compatible con un flujo de entrenamiento/fine-tuning ligero inspirado en repositorios educativos como `train-llm-from-scratch`, pero produccion debe empezar con modelo base evaluado + RAG.
+- La IA nunca calcula plazos; solo expone `TermDays` mencionado para que `EcuadorDeadlineEngine` calcule.
 
 ## Motor de plazos Ecuador
 

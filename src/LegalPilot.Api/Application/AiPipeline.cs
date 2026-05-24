@@ -27,7 +27,14 @@ public sealed class LegalAiPipelineService(
                 datasetFormat = "jsonl",
                 labels = LegalLabels(),
                 feedbackSamples = store.AiFeedbackEntries.Count(f => f.TenantId == principal.TenantId),
-                status = "Prepared"
+                status = "Prepared",
+                exportEndpoint = "/api/ai/dataset.jsonl"
+            },
+            training = new
+            {
+                strategy = "RAG primero, fine-tuning ligero despues de dataset etiquetado.",
+                compatibleFormat = "instruction-jsonl",
+                fromScratchReference = "Use solo para experimentacion controlada; produccion debe iniciar con modelo base evaluado."
             },
             guardrails = Guardrails(),
             recentRuns = store.AiProcessingRuns
@@ -130,6 +137,50 @@ public sealed class LegalAiPipelineService(
         return entry;
     }
 
+    public string ExportDatasetJsonl(AuthPrincipal principal)
+    {
+        HttpAuth.RequireRole(principal, UserRole.SuperAdmin, UserRole.Lawyer);
+        var rows = store.Read(() => store.Emails
+            .Where(e => e.TenantId == principal.TenantId && e.Extraction is not null)
+            .OrderByDescending(e => e.CreatedAt)
+            .Take(500)
+            .Select(e => new
+            {
+                instruction = "Clasifica y extrae datos legales de Ecuador. No calcules plazos; solo devuelve el termino mencionado si aparece.",
+                input = new
+                {
+                    e.Subject,
+                    e.Sender,
+                    e.BodyText
+                },
+                output = new
+                {
+                    label = ToTrainingLabel(e.Extraction!.ActType),
+                    e.Extraction.CaseNumber,
+                    e.Extraction.CourtOrOffice,
+                    e.Extraction.EventDate,
+                    e.Extraction.EventTime,
+                    e.Extraction.Location,
+                    e.Extraction.TermDays,
+                    e.Extraction.Obligation,
+                    e.Extraction.RequiresResponse,
+                    e.Extraction.Priority,
+                    e.Extraction.Signals,
+                    summary = e.Extraction.LawyerSummary
+                },
+                metadata = new
+                {
+                    source = "legalpilot-email",
+                    legalEmailId = e.Id,
+                    createdAt = e.CreatedAt,
+                    requiresHumanReview = e.Extraction.Confidence < 0.80m
+                }
+            })
+            .ToArray());
+
+        return string.Join('\n', rows.Select(row => JsonSerializer.Serialize(row, Json)));
+    }
+
     private static string[] LegalLabels()
     {
         return
@@ -145,6 +196,23 @@ public sealed class LegalAiPipelineService(
             "requerimiento",
             "otro"
         ];
+    }
+
+    private static string ToTrainingLabel(LegalActType type)
+    {
+        return type switch
+        {
+            LegalActType.Hearing => "audiencia",
+            LegalActType.Summons => "citacion",
+            LegalActType.JudicialNotification => "notificacion",
+            LegalActType.Ruling => "providencia",
+            LegalActType.ExpertReview => "pericia",
+            LegalActType.ProsecutorNotification => "fiscalia",
+            LegalActType.Deadline => "plazo",
+            LegalActType.OfficialLetter => "requerimiento",
+            LegalActType.Diligence => "requerimiento",
+            _ => "otro"
+        };
     }
 
     private static object Guardrails()
