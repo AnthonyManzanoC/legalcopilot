@@ -12,6 +12,11 @@ public sealed class AuthService(LegalPilotStore store, PasswordHasher hasher, To
     {
         email = InputGuard.Email(email);
         password = InputGuard.Required(password, "Contrasena", 256);
+        if (store.Read(() => store.Users.All(u => !u.IsActive)))
+        {
+            throw new UnauthorizedAccessException("No hay usuario administrador inicial. Configure LEGALPILOT_BOOTSTRAP_ADMIN_EMAIL y LEGALPILOT_BOOTSTRAP_ADMIN_PASSWORD, reinicie la API y vuelva a entrar.");
+        }
+
         var user = store.Read(() => store.Users.FirstOrDefault(u =>
             u.Email.Equals(email, StringComparison.OrdinalIgnoreCase) && u.IsActive));
 
@@ -183,13 +188,22 @@ public sealed class AuthService(LegalPilotStore store, PasswordHasher hasher, To
 
     private (string RawToken, RefreshTokenSession Session) CreateRefreshSession(UserAccount user, string? ipAddress)
     {
-        return store.Write(() => CreateRefreshSessionUnsafe(user, ipAddress));
+        var refresh = BuildRefreshSession(user, ipAddress);
+        store.AddRefreshTokenSession(refresh.Session);
+        return refresh;
     }
 
     private (string RawToken, RefreshTokenSession Session) CreateRefreshSessionUnsafe(UserAccount user, string? ipAddress)
     {
+        var refresh = BuildRefreshSession(user, ipAddress);
+        store.RefreshTokenSessions.Add(refresh.Session);
+        return refresh;
+    }
+
+    private static (string RawToken, RefreshTokenSession Session) BuildRefreshSession(UserAccount user, string? ipAddress)
+    {
         var raw = TokenService.RandomToken(48);
-        var session = new RefreshTokenSession(
+        return (raw, new RefreshTokenSession(
             Guid.NewGuid(),
             user.TenantId,
             user.Id,
@@ -198,9 +212,7 @@ public sealed class AuthService(LegalPilotStore store, PasswordHasher hasher, To
             DateTimeOffset.UtcNow,
             ipAddress,
             null,
-            null);
-        store.RefreshTokenSessions.Add(session);
-        return (raw, session);
+            null));
     }
 
     private static void ValidatePassword(string password)
@@ -386,8 +398,71 @@ public sealed class MailboxService(LegalPilotStore store, EmailConnectorRegistry
             null);
 
         store.Write(() => store.Mailboxes.Add(mailbox));
-        store.Audit(principal.TenantId, principal.UserId, AuditAction.Create, nameof(MailboxConnection), mailbox.Id.ToString(), $"Buzon registrado: {mailbox.Email}. Estado: {mailbox.Status}");
+        store.Audit(principal.TenantId, principal.UserId, AuditAction.ConnectIntegration, nameof(MailboxConnection), mailbox.Id.ToString(), $"Buzon registrado: {mailbox.Email}. Estado: {mailbox.Status}");
         return mailbox;
+    }
+
+    public MailboxConnection UpdateCalendarPreference(AuthPrincipal principal, Guid mailboxId, UpdateMailboxCalendarRequest request)
+    {
+        HttpAuth.RequireRole(principal, UserRole.SuperAdmin, UserRole.Lawyer);
+        var calendarId = InputGuard.Optional(request.CalendarId, 180);
+        return store.Write(() =>
+        {
+            var index = store.Mailboxes.FindIndex(m => m.Id == mailboxId && m.TenantId == principal.TenantId);
+            if (index < 0)
+            {
+                throw new KeyNotFoundException("Buzon no encontrado.");
+            }
+
+            var mailbox = store.Mailboxes[index] with
+            {
+                DefaultCalendarId = string.IsNullOrWhiteSpace(calendarId) ? null : calendarId,
+                LastError = null
+            };
+            store.Mailboxes[index] = mailbox;
+            store.Audit(principal.TenantId, principal.UserId, AuditAction.Update, nameof(MailboxConnection), mailbox.Id.ToString(), $"Calendario predeterminado actualizado para {mailbox.Provider}.");
+            return mailbox;
+        });
+    }
+
+    public MailboxConnection Disconnect(AuthPrincipal principal, Guid mailboxId)
+    {
+        HttpAuth.RequireRole(principal, UserRole.SuperAdmin, UserRole.Lawyer);
+        return store.Write(() =>
+        {
+            var index = store.Mailboxes.FindIndex(m => m.Id == mailboxId && m.TenantId == principal.TenantId);
+            if (index < 0)
+            {
+                throw new KeyNotFoundException("Buzon no encontrado.");
+            }
+
+            var mailbox = store.Mailboxes[index] with
+            {
+                Status = "Disconnected",
+                Cursor = null,
+                WatchExpiresAt = null,
+                WebhookSubscriptionId = null,
+                WebhookRenewedAt = DateTimeOffset.UtcNow,
+                LastError = null
+            };
+            store.Mailboxes[index] = mailbox;
+
+            for (var i = 0; i < store.OAuthTokenCredentials.Count; i++)
+            {
+                var token = store.OAuthTokenCredentials[i];
+                if (token.TenantId == principal.TenantId && token.MailboxConnectionId == mailbox.Id && token.Status != "Revoked")
+                {
+                    store.OAuthTokenCredentials[i] = token with
+                    {
+                        Status = "Revoked",
+                        UpdatedAt = DateTimeOffset.UtcNow
+                    };
+                }
+            }
+
+            store.Audit(principal.TenantId, principal.UserId, AuditAction.DisconnectIntegration, nameof(MailboxConnection), mailbox.Id.ToString(), $"Buzon desconectado localmente: {mailbox.Email}.");
+            return mailbox;
+        });
     }
 
     public async Task<MailboxSyncState> Sync(AuthPrincipal principal, Guid mailboxId, CancellationToken cancellationToken)
@@ -446,10 +521,16 @@ public sealed class MailboxService(LegalPilotStore store, EmailConnectorRegistry
 
             store.MailboxSyncStates.Insert(0, state);
             var index = store.Mailboxes.FindIndex(m => m.Id == mailbox.Id);
-            store.Mailboxes[index] = mailbox with
+            var current = index >= 0 ? store.Mailboxes[index] : mailbox;
+            store.Mailboxes[index] = current with
             {
                 Status = result.Status,
-                LastSyncAt = DateTimeOffset.UtcNow
+                LastSyncAt = DateTimeOffset.UtcNow,
+                Cursor = result.Cursor ?? current.Cursor,
+                WatchExpiresAt = result.WatchExpiresAt ?? current.WatchExpiresAt,
+                WebhookSubscriptionId = result.SubscriptionId ?? current.WebhookSubscriptionId,
+                WebhookRenewedAt = result.SubscriptionId is null ? current.WebhookRenewedAt : DateTimeOffset.UtcNow,
+                LastError = result.Success ? null : result.Message
             };
             store.Audit(mailbox.TenantId, actorUserId, AuditAction.SyncAttempt, nameof(MailboxConnection), mailbox.Id.ToString(), result.Message);
             return state;
@@ -460,7 +541,8 @@ public sealed class MailboxService(LegalPilotStore store, EmailConnectorRegistry
 public sealed class LegalWorkflowService(
     LegalPilotStore store,
     LegalIntelligenceService intelligence,
-    EcuadorDeadlineEngine deadlineEngine)
+    EcuadorDeadlineEngine deadlineEngine,
+    IConfiguration configuration)
 {
     public LegalEmail IngestManual(AuthPrincipal principal, ManualEmailRequest request)
     {
@@ -471,6 +553,7 @@ public sealed class LegalWorkflowService(
         var bodyText = InputGuard.TextBlock(request.BodyText, "Cuerpo", 12000);
         EnsureCaseAndMailbox(principal.TenantId, request.CaseId, request.MailboxConnectionId);
         var externalMessageId = InputGuard.Optional(request.ExternalMessageId, 180);
+        var messageHash = BuildMessageHash(provider, externalMessageId, subject, sender, bodyText, request.ReceivedAt);
         if (!string.IsNullOrWhiteSpace(externalMessageId))
         {
             var existing = FindExistingEmail(principal.TenantId, provider, externalMessageId);
@@ -479,6 +562,11 @@ public sealed class LegalWorkflowService(
                 store.Audit(principal.TenantId, principal.UserId, AuditAction.IngestEmail, nameof(LegalEmail), existing.Id.ToString(), "Correo duplicado omitido por idempotencia.");
                 return existing;
             }
+        }
+        else if (FindExistingEmailByHash(principal.TenantId, provider, messageHash) is { } existing)
+        {
+            store.Audit(principal.TenantId, principal.UserId, AuditAction.IngestEmail, nameof(LegalEmail), existing.Id.ToString(), "Correo duplicado omitido por huella de mensaje.");
+            return existing;
         }
 
         var emailId = Guid.NewGuid();
@@ -503,12 +591,16 @@ public sealed class LegalWorkflowService(
             request.ReceivedAt ?? now,
             "Processed",
             extraction,
-            now);
+            now,
+            messageHash,
+            extraction.Signals.Any(s => s.Equals("fallback-local-heuristic", StringComparison.OrdinalIgnoreCase)),
+            extraction.Signals.Any(s => s.Equals("fallback-local-heuristic", StringComparison.OrdinalIgnoreCase)) ? "LLM externo no disponible o salida invalida." : null);
 
         store.Write(() =>
         {
             store.Emails.Insert(0, email);
             store.Attachments.AddRange(attachments);
+            store.MailProcessingLogs.Insert(0, new MailProcessingLog(Guid.NewGuid(), email.TenantId, email.MailboxConnectionId, email.Id, email.Provider, "ingest", "Completed", "Correo manual persistido y clasificado.", 1, now, null));
         });
         store.Audit(principal.TenantId, principal.UserId, AuditAction.IngestEmail, nameof(LegalEmail), email.Id.ToString(), $"Correo legal ingerido: {email.Subject}");
         store.Audit(principal.TenantId, principal.UserId, AuditAction.ClassifyEmail, nameof(LegalEmail), email.Id.ToString(), extraction.LawyerSummary);
@@ -520,6 +612,7 @@ public sealed class LegalWorkflowService(
     public LegalEmail IngestWebhook(Guid tenantId, MailProvider provider, WebhookEmailEnvelope envelope)
     {
         var externalMessageId = InputGuard.Optional(envelope.ExternalMessageId, 180);
+        var messageHash = BuildMessageHash(provider, externalMessageId, envelope.Subject, envelope.Sender, envelope.BodyText, envelope.ReceivedAt);
         if (!string.IsNullOrWhiteSpace(externalMessageId))
         {
             var existing = FindExistingEmail(tenantId, provider, externalMessageId);
@@ -528,6 +621,11 @@ public sealed class LegalWorkflowService(
                 store.Audit(tenantId, null, AuditAction.WebhookReceived, nameof(LegalEmail), existing.Id.ToString(), $"Webhook {provider} duplicado omitido.");
                 return existing;
             }
+        }
+        else if (FindExistingEmailByHash(tenantId, provider, messageHash) is { } existing)
+        {
+            store.Audit(tenantId, null, AuditAction.WebhookReceived, nameof(LegalEmail), existing.Id.ToString(), $"Webhook {provider} duplicado omitido por huella.");
+            return existing;
         }
 
         var subject = InputGuard.Required(envelope.Subject, "Asunto", 240);
@@ -542,7 +640,7 @@ public sealed class LegalWorkflowService(
         var email = new LegalEmail(
             emailId,
             tenantId,
-            null,
+            envelope.MailboxConnectionId,
             caseId,
             provider,
             string.IsNullOrWhiteSpace(externalMessageId) ? $"webhook-{Guid.NewGuid():N}" : externalMessageId,
@@ -554,12 +652,16 @@ public sealed class LegalWorkflowService(
             envelope.ReceivedAt ?? now,
             "ProcessedFromWebhook",
             extraction,
-            now);
+            now,
+            messageHash,
+            extraction.Signals.Any(s => s.Equals("fallback-local-heuristic", StringComparison.OrdinalIgnoreCase)),
+            extraction.Signals.Any(s => s.Equals("fallback-local-heuristic", StringComparison.OrdinalIgnoreCase)) ? "LLM externo no disponible o salida invalida." : null);
 
         store.Write(() =>
         {
             store.Emails.Insert(0, email);
             store.Attachments.AddRange(attachments);
+            store.MailProcessingLogs.Insert(0, new MailProcessingLog(Guid.NewGuid(), tenantId, envelope.MailboxConnectionId, email.Id, provider, "webhook-ingest", "Completed", $"Correo persistido desde {provider}. Adjuntos: {attachments.Count}.", 1, now, null));
         });
         store.Audit(tenantId, null, AuditAction.WebhookReceived, nameof(LegalEmail), email.Id.ToString(), $"Webhook {provider} procesado. Adjuntos: {attachments.Count}.");
         CreateDerivedWork(email, null);
@@ -624,11 +726,14 @@ public sealed class LegalWorkflowService(
             starts,
             starts.AddMinutes(30),
             responsible,
-            true,
-            false,
+            !request.Confirmed,
+            request.Confirmed,
             null,
             null,
-            DateTimeOffset.UtcNow);
+            DateTimeOffset.UtcNow,
+            null,
+            "Scheduled",
+            request.Confirmed ? "Pending" : "NeedsConfirmation");
         store.Write(() => store.CalendarEvents.Insert(0, calendarEvent));
         CreateReminderSet(principal.TenantId, calendarEvent, deadline.Title, holidays);
         return deadline;
@@ -640,6 +745,23 @@ public sealed class LegalWorkflowService(
             e.TenantId == tenantId &&
             e.Provider == provider &&
             e.ExternalMessageId.Equals(externalMessageId, StringComparison.OrdinalIgnoreCase)));
+    }
+
+    private LegalEmail? FindExistingEmailByHash(Guid tenantId, MailProvider? provider, string messageHash)
+    {
+        return store.Read(() => store.Emails.FirstOrDefault(e =>
+            e.TenantId == tenantId &&
+            e.Provider == provider &&
+            !string.IsNullOrWhiteSpace(e.MessageHash) &&
+            e.MessageHash.Equals(messageHash, StringComparison.OrdinalIgnoreCase)));
+    }
+
+    private static string BuildMessageHash(MailProvider? provider, string? externalMessageId, string subject, string sender, string body, DateTimeOffset? receivedAt)
+    {
+        var basis = string.IsNullOrWhiteSpace(externalMessageId)
+            ? $"{provider}|{sender}|{subject}|{receivedAt:O}|{body[..Math.Min(body.Length, 400)]}"
+            : $"{provider}|{externalMessageId}";
+        return TokenService.Sha256(basis);
     }
 
     private void EnsureCaseAndMailbox(Guid tenantId, Guid? caseId, Guid? mailboxConnectionId)
@@ -735,7 +857,16 @@ public sealed class LegalWorkflowService(
             store.Audit(email.TenantId, actorUserId, AuditAction.CalculateDeadline, nameof(Deadline), deadline.Id.ToString(), calculation.Explanation);
 
             var starts = ToQuitoDateTimeOffset(calculation.DueDate, new TimeOnly(9, 0));
-            var calendarEvent = CreateCalendarEvent(email, deadline.Id, CalendarEventType.Deadline, deadline.Title, null, starts, starts.AddMinutes(30), responsible, true);
+            var calendarEvent = CreateCalendarEvent(
+                email,
+                deadline.Id,
+                CalendarEventType.Deadline,
+                deadline.Title,
+                null,
+                starts,
+                starts.AddMinutes(30),
+                responsible,
+                !AutoConfirmDerivedCalendar(email.Extraction.Confidence));
             CreateReminderSet(email.TenantId, calendarEvent, deadline.Title, holidays);
         }
 
@@ -759,10 +890,29 @@ public sealed class LegalWorkflowService(
 
             if (!exists)
             {
-                var calendarEvent = CreateCalendarEvent(email, null, type, title, email.Extraction.Location, starts, starts.AddHours(1), responsible, true);
+                var calendarEvent = CreateCalendarEvent(
+                    email,
+                    null,
+                    type,
+                    title,
+                    email.Extraction.Location,
+                    starts,
+                    starts.AddHours(1),
+                    responsible,
+                    !AutoConfirmDerivedCalendar(email.Extraction.Confidence));
                 CreateReminderSet(email.TenantId, calendarEvent, title, holidays);
             }
         }
+    }
+
+    private bool AutoConfirmDerivedCalendar(decimal confidence)
+    {
+        var configured = configuration["LegalPilot:Automation:AutoConfirmDerivedCalendar"];
+        var enabled = string.IsNullOrWhiteSpace(configured) ||
+                      string.Equals(configured, "true", StringComparison.OrdinalIgnoreCase);
+        var thresholdText = configuration["LegalPilot:Automation:AutoConfirmMinConfidence"];
+        var threshold = decimal.TryParse(thresholdText, out var parsed) ? parsed : 0.70m;
+        return enabled && confidence >= threshold;
     }
 
     private Guid ResolveResponsible(LegalEmail email)
@@ -802,10 +952,13 @@ public sealed class LegalWorkflowService(
             ends,
             responsible,
             requiresConfirmation,
-            false,
+            !requiresConfirmation,
             null,
             null,
-            DateTimeOffset.UtcNow);
+            DateTimeOffset.UtcNow,
+            null,
+            "Scheduled",
+            requiresConfirmation ? "NeedsConfirmation" : "Pending");
 
         store.Write(() => store.CalendarEvents.Insert(0, calendarEvent));
         store.Audit(email.TenantId, responsible, AuditAction.CreateCalendarEvent, nameof(CalendarEvent), calendarEvent.Id.ToString(), $"Evento creado: {title}");
@@ -1245,7 +1398,16 @@ public sealed class MailboxSyncWorker(
     private async Task CheckRegisteredMailboxes(CancellationToken cancellationToken)
     {
         var mailboxes = store.Read(() => store.Mailboxes
-            .Where(m => m.LastSyncAt is null || m.LastSyncAt < DateTimeOffset.UtcNow.AddMinutes(-15))
+            .Where(m => m.Status != "Disconnected" && m.Status != "Revoked")
+            .Where(m =>
+            {
+                var latest = store.MailboxSyncStates
+                    .Where(s => s.MailboxConnectionId == m.Id)
+                    .OrderByDescending(s => s.CheckedAt)
+                    .FirstOrDefault();
+                return (latest?.NextAttemptAt is null || latest.NextAttemptAt <= DateTimeOffset.UtcNow) &&
+                       (m.LastSyncAt is null || m.LastSyncAt < DateTimeOffset.UtcNow.AddMinutes(-15) || m.WatchExpiresAt <= DateTimeOffset.UtcNow.AddHours(12));
+            })
             .Take(10)
             .ToArray());
 
@@ -1275,10 +1437,16 @@ public sealed class MailboxSyncWorker(
                     var index = store.Mailboxes.FindIndex(m => m.Id == mailbox.Id);
                     if (index >= 0)
                     {
-                        store.Mailboxes[index] = mailbox with
+                        var current = store.Mailboxes[index];
+                        store.Mailboxes[index] = current with
                         {
                             Status = result.Status,
-                            LastSyncAt = DateTimeOffset.UtcNow
+                            LastSyncAt = DateTimeOffset.UtcNow,
+                            Cursor = result.Cursor ?? current.Cursor,
+                            WatchExpiresAt = result.WatchExpiresAt ?? current.WatchExpiresAt,
+                            WebhookSubscriptionId = result.SubscriptionId ?? current.WebhookSubscriptionId,
+                            WebhookRenewedAt = result.SubscriptionId is null ? current.WebhookRenewedAt : DateTimeOffset.UtcNow,
+                            LastError = result.Success ? null : result.Message
                         };
                     }
                 });
@@ -1408,7 +1576,13 @@ public sealed class CalendarService(LegalPilotStore store)
             false,
             null,
             null,
-            DateTimeOffset.UtcNow);
+            DateTimeOffset.UtcNow,
+            null,
+            "Scheduled",
+            request.RequiresConfirmation ? "NeedsConfirmation" : "Pending",
+            null,
+            null,
+            null);
         store.Write(() => store.CalendarEvents.Insert(0, item));
         store.Audit(principal.TenantId, principal.UserId, AuditAction.CreateCalendarEvent, nameof(CalendarEvent), item.Id.ToString(), $"Evento manual creado: {item.Title}");
         return item;
@@ -1424,9 +1598,90 @@ public sealed class CalendarService(LegalPilotStore store)
                 throw new KeyNotFoundException("Evento no encontrado.");
             }
 
-            var updated = store.CalendarEvents[index] with { Confirmed = true };
+            var updated = store.CalendarEvents[index] with
+            {
+                Confirmed = true,
+                SyncStatus = string.IsNullOrWhiteSpace(store.CalendarEvents[index].ExternalEventId) ? "Pending" : "PendingUpdate",
+                UpdatedAt = DateTimeOffset.UtcNow,
+                SyncError = null
+            };
             store.CalendarEvents[index] = updated;
             store.Audit(principal.TenantId, principal.UserId, AuditAction.Approve, nameof(CalendarEvent), id.ToString(), "Evento confirmado.");
+            return updated;
+        });
+    }
+
+    public CalendarEvent Update(AuthPrincipal principal, Guid id, UpdateCalendarEventRequest request)
+    {
+        HttpAuth.RequireRole(principal, UserRole.SuperAdmin, UserRole.Lawyer, UserRole.Assistant);
+        return store.Write(() =>
+        {
+            var index = store.CalendarEvents.FindIndex(e => e.Id == id && e.TenantId == principal.TenantId);
+            if (index < 0)
+            {
+                throw new KeyNotFoundException("Evento no encontrado.");
+            }
+
+            var current = store.CalendarEvents[index];
+            var title = string.IsNullOrWhiteSpace(request.Title)
+                ? current.Title
+                : InputGuard.Required(request.Title, "Titulo", 180);
+            var startsAt = request.StartsAt ?? current.StartsAt;
+            var endsAt = request.EndsAt ?? current.EndsAt;
+            InputGuard.DateRange(startsAt, endsAt);
+
+            var updated = current with
+            {
+                Type = request.Type ?? current.Type,
+                Title = title,
+                Location = request.Location is null ? current.Location : InputGuard.Optional(request.Location, 240),
+                StartsAt = startsAt,
+                EndsAt = endsAt,
+                RequiresConfirmation = request.RequiresConfirmation ?? current.RequiresConfirmation,
+                Confirmed = request.Confirmed ?? current.Confirmed,
+                Description = request.Description is null ? current.Description : (InputGuard.Optional(request.Description, 2000) is { Length: > 0 } description ? description : null),
+                UpdatedAt = DateTimeOffset.UtcNow,
+                SyncStatus = current.Confirmed || request.Confirmed == true
+                    ? (string.IsNullOrWhiteSpace(current.ExternalEventId) ? "Pending" : "PendingUpdate")
+                    : "NeedsConfirmation",
+                SyncError = null
+            };
+            store.CalendarEvents[index] = updated;
+            store.Audit(principal.TenantId, principal.UserId, AuditAction.Update, nameof(CalendarEvent), id.ToString(), $"Evento actualizado: {updated.Title}");
+            return updated;
+        });
+    }
+
+    public CalendarEvent Cancel(AuthPrincipal principal, Guid id)
+    {
+        HttpAuth.RequireRole(principal, UserRole.SuperAdmin, UserRole.Lawyer);
+        return store.Write(() =>
+        {
+            var index = store.CalendarEvents.FindIndex(e => e.Id == id && e.TenantId == principal.TenantId);
+            if (index < 0)
+            {
+                throw new KeyNotFoundException("Evento no encontrado.");
+            }
+
+            var current = store.CalendarEvents[index];
+            var updated = current with
+            {
+                Status = "Cancelled",
+                SyncStatus = string.IsNullOrWhiteSpace(current.ExternalEventId) ? "Cancelled" : "PendingDelete",
+                UpdatedAt = DateTimeOffset.UtcNow,
+                SyncError = null
+            };
+            store.CalendarEvents[index] = updated;
+
+            for (var i = 0; i < store.Reminders.Count; i++)
+            {
+                if (store.Reminders[i].CalendarEventId == id && store.Reminders[i].Status == NotificationStatus.Pending)
+                {
+                    store.Reminders[i] = store.Reminders[i] with { Status = NotificationStatus.Acknowledged };
+                }
+            }
+
+            store.Audit(principal.TenantId, principal.UserId, AuditAction.Delete, nameof(CalendarEvent), id.ToString(), $"Evento cancelado: {updated.Title}");
             return updated;
         });
     }
@@ -1777,11 +2032,13 @@ public sealed record LogoutRequest(string? RefreshToken);
 public sealed record CreateCaseRequest(string Title, string CaseNumber, string Matter, string CourtOrOffice, Guid? ClientId, Guid? ResponsibleUserId);
 public sealed record CreateClientRequest(string FullName, string Email, string Phone, string Identification);
 public sealed record ConnectMailboxRequest(MailProvider Provider, string Email, string? ExternalAccountId);
+public sealed record UpdateMailboxCalendarRequest(string? CalendarId);
 public sealed record ManualEmailRequest(MailProvider? Provider, Guid? MailboxConnectionId, Guid? CaseId, string? ExternalMessageId, string Subject, string Sender, string[]? Recipients, string BodyText, string? RawReference, DateTimeOffset? ReceivedAt, EmailAttachmentInput[]? Attachments = null);
 public sealed record CreateDeadlineRequest(string Title, Guid? CaseId, DateOnly NotificationDate, int TermDays, string Matter, string? Province, string? Canton, string? RuleCode, Guid? ResponsibleUserId, bool Confirmed);
-public sealed record WebhookEmailEnvelope(string? ExternalMessageId, string Subject, string Sender, string[]? Recipients, string BodyText, string? RawReference, DateTimeOffset? ReceivedAt, EmailAttachmentInput[]? Attachments = null);
+public sealed record WebhookEmailEnvelope(string? ExternalMessageId, string Subject, string Sender, string[]? Recipients, string BodyText, string? RawReference, DateTimeOffset? ReceivedAt, EmailAttachmentInput[]? Attachments = null, Guid? MailboxConnectionId = null);
 public sealed record EmailAttachmentInput(string FileName, string? ContentType, string? ContentBase64, string? TextContent, long? SizeBytes = null);
 public sealed record CreateCalendarEventRequest(Guid? CaseId, CalendarEventType Type, string Title, string? Location, DateTimeOffset StartsAt, DateTimeOffset EndsAt, Guid? ResponsibleUserId, bool RequiresConfirmation);
+public sealed record UpdateCalendarEventRequest(CalendarEventType? Type, string? Title, string? Location, DateTimeOffset? StartsAt, DateTimeOffset? EndsAt, bool? RequiresConfirmation, bool? Confirmed, string? Description);
 public sealed record SendWhatsAppRequest(Guid? ClientId, Guid? CaseId, string? To, string Body, bool Approved);
 public sealed record CreateChatMessageRequest(Guid? ClientId, Guid? CaseId, ChatDirection Direction, NotificationChannel Channel, string Body, bool RequiresHumanReview);
 public sealed record OpenWaWebhookRequest(string? SessionId, string? From, string? Body, string? Event, string? ChatId = null, string? Text = null);
@@ -1792,13 +2049,13 @@ public static class WebhookParsers
 {
     public static WebhookEmailEnvelope FromGmailPubSub(GmailWebhookRequest request)
     {
-        var decoded = DecodeBase64Json(request.Message.Data);
+        var decoded = DecodeBase64Json(request.Message?.Data);
         var email = decoded.RootElement.TryGetProperty("emailAddress", out var emailAddress)
             ? emailAddress.GetString() ?? "gmail-notification"
             : "gmail-notification";
         var history = decoded.RootElement.TryGetProperty("historyId", out var historyId)
             ? historyId.GetString()
-            : request.Message.MessageId;
+            : request.Message?.MessageId;
 
         return new WebhookEmailEnvelope(
             history,

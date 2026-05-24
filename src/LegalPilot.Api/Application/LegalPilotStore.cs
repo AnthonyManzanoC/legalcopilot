@@ -1,5 +1,6 @@
 using LegalPilot.Api.Domain;
 using LegalPilot.Api.Infrastructure;
+using Npgsql;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -25,9 +26,12 @@ public sealed class LegalPilotStore
     public List<OAuthTokenCredential> OAuthTokenCredentials { get; } = [];
     public List<LegalEmail> Emails { get; } = [];
     public List<DocumentAttachment> Attachments { get; } = [];
+    public List<MailWebhookEvent> MailWebhookEvents { get; } = [];
+    public List<MailProcessingLog> MailProcessingLogs { get; } = [];
     public List<Holiday> Holidays { get; } = [];
     public List<Deadline> Deadlines { get; } = [];
     public List<CalendarEvent> CalendarEvents { get; } = [];
+    public List<CalendarSyncLog> CalendarSyncLogs { get; } = [];
     public List<Reminder> Reminders { get; } = [];
     public List<Notification> Notifications { get; } = [];
     public List<WhatsAppTemplate> WhatsAppTemplates { get; } = [];
@@ -61,9 +65,11 @@ public sealed class LegalPilotStore
             throw new InvalidOperationException("PostgreSQL es obligatorio en produccion. Configure LEGALPILOT_DATABASE_URL o ConnectionStrings:LegalPilotPostgres desde variables de entorno o Secret Manager.");
         }
 
+        var migrateLocalJson = string.Equals(configuration["LegalPilot:Storage:MigrateLocalJson"], "true", StringComparison.OrdinalIgnoreCase);
+
         _persistence = string.IsNullOrWhiteSpace(postgresConnection)
             ? new JsonFileLegalPilotPersistence(dataFile, _jsonOptions, logger)
-            : new PostgresLegalPilotPersistence(postgresConnection, dataFile, _jsonOptions, logger);
+            : new PostgresLegalPilotPersistence(postgresConnection, dataFile, _jsonOptions, logger, migrateLocalJson);
 
         Load();
     }
@@ -97,19 +103,43 @@ public sealed class LegalPilotStore
 
     public void Audit(Guid tenantId, Guid? actorUserId, AuditAction action, string entityType, string entityId, string summary, IReadOnlyDictionary<string, string>? metadata = null)
     {
-        Write(() =>
+        var entry = new AuditEntry(
+            Guid.NewGuid(),
+            tenantId,
+            actorUserId,
+            action,
+            entityType,
+            entityId,
+            summary,
+            metadata ?? new Dictionary<string, string>(),
+            DateTimeOffset.UtcNow);
+
+        lock (_gate)
         {
-            AuditEntries.Insert(0, new AuditEntry(
-                Guid.NewGuid(),
-                tenantId,
-                actorUserId,
-                action,
-                entityType,
-                entityId,
-                summary,
-                metadata ?? new Dictionary<string, string>(),
-                DateTimeOffset.UtcNow));
-        });
+            AuditEntries.Insert(0, entry);
+            if (_persistence is ILegalPilotIncrementalPersistence incremental)
+            {
+                incremental.PersistAuditEntry(entry);
+                return;
+            }
+
+            Persist();
+        }
+    }
+
+    public void AddRefreshTokenSession(RefreshTokenSession session)
+    {
+        lock (_gate)
+        {
+            RefreshTokenSessions.Add(session);
+            if (_persistence is ILegalPilotIncrementalPersistence incremental)
+            {
+                incremental.PersistRefreshTokenSession(session);
+                return;
+            }
+
+            Persist();
+        }
     }
 
     public string DataFilePath => _persistence.DataSource;
@@ -146,9 +176,12 @@ public sealed class LegalPilotStore
             OAuthTokenCredentials.AddRange(snapshot.OAuthTokenCredentials ?? []);
             Emails.AddRange(snapshot.Emails ?? []);
             Attachments.AddRange(snapshot.Attachments ?? []);
+            MailWebhookEvents.AddRange(snapshot.MailWebhookEvents ?? []);
+            MailProcessingLogs.AddRange(snapshot.MailProcessingLogs ?? []);
             Holidays.AddRange(snapshot.Holidays ?? []);
             Deadlines.AddRange(snapshot.Deadlines ?? []);
             CalendarEvents.AddRange(snapshot.CalendarEvents ?? []);
+            CalendarSyncLogs.AddRange(snapshot.CalendarSyncLogs ?? []);
             Reminders.AddRange(snapshot.Reminders ?? []);
             Notifications.AddRange(snapshot.Notifications ?? []);
             WhatsAppTemplates.AddRange(snapshot.WhatsAppTemplates ?? []);
@@ -172,7 +205,7 @@ public sealed class LegalPilotStore
     private void Persist()
     {
         var snapshot = new StoreSnapshot(
-            4,
+            5,
             Tenants,
             Users,
             Clients,
@@ -183,9 +216,12 @@ public sealed class LegalPilotStore
             OAuthTokenCredentials,
             Emails,
             Attachments,
+            MailWebhookEvents,
+            MailProcessingLogs,
             Holidays,
             Deadlines,
             CalendarEvents,
+            CalendarSyncLogs,
             Reminders,
             Notifications,
             WhatsAppTemplates,
@@ -219,9 +255,12 @@ public sealed record StoreSnapshot(
     List<OAuthTokenCredential>? OAuthTokenCredentials,
     List<LegalEmail>? Emails,
     List<DocumentAttachment>? Attachments,
+    List<MailWebhookEvent>? MailWebhookEvents,
+    List<MailProcessingLog>? MailProcessingLogs,
     List<Holiday>? Holidays,
     List<Deadline>? Deadlines,
     List<CalendarEvent>? CalendarEvents,
+    List<CalendarSyncLog>? CalendarSyncLogs,
     List<Reminder>? Reminders,
     List<Notification>? Notifications,
     List<WhatsAppTemplate>? WhatsAppTemplates,
@@ -241,6 +280,12 @@ public interface ILegalPilotPersistence
     StoreSnapshot? Load();
     void Persist(StoreSnapshot snapshot);
     object Diagnostics();
+}
+
+public interface ILegalPilotIncrementalPersistence
+{
+    void PersistAuditEntry(AuditEntry entry);
+    void PersistRefreshTokenSession(RefreshTokenSession session);
 }
 
 public sealed class JsonFileLegalPilotPersistence(
@@ -299,6 +344,7 @@ public static class SeedData
     {
         if (store.Tenants.Count > 0)
         {
+            EnsureConfiguredBootstrap(store, hasher, configuration, environment);
             return;
         }
 
@@ -306,17 +352,22 @@ public static class SeedData
         var production = environment?.IsProduction() == true;
         var tenantName = FirstConfigured(
             Environment.GetEnvironmentVariable("LEGALPILOT_BOOTSTRAP_TENANT_NAME"),
-            configuration?["LegalPilot:Bootstrap:TenantName"]) ?? "LegalPilot Demo Ecuador";
+            configuration?["LegalPilot:Bootstrap:TenantName"]) ?? "LegalPilot Ecuador";
         var adminEmail = FirstConfigured(
             Environment.GetEnvironmentVariable("LEGALPILOT_BOOTSTRAP_ADMIN_EMAIL"),
-            configuration?["LegalPilot:Bootstrap:AdminEmail"]) ?? (production ? null : "admin@legalpilot.ec");
+            configuration?["LegalPilot:Bootstrap:AdminEmail"]);
         var adminPassword = FirstConfigured(
             Environment.GetEnvironmentVariable("LEGALPILOT_BOOTSTRAP_ADMIN_PASSWORD"),
-            configuration?["LegalPilot:Bootstrap:AdminPassword"]) ?? (production ? null : "LegalPilot#2026");
+            configuration?["LegalPilot:Bootstrap:AdminPassword"]);
 
         if (string.IsNullOrWhiteSpace(adminEmail) || string.IsNullOrWhiteSpace(adminPassword))
         {
-            throw new InvalidOperationException("Base vacia en produccion: configure LEGALPILOT_BOOTSTRAP_ADMIN_EMAIL y LEGALPILOT_BOOTSTRAP_ADMIN_PASSWORD para crear el primer usuario.");
+            if (production)
+            {
+                throw new InvalidOperationException("Base vacia en produccion: configure LEGALPILOT_BOOTSTRAP_ADMIN_EMAIL y LEGALPILOT_BOOTSTRAP_ADMIN_PASSWORD para crear el primer usuario.");
+            }
+
+            return;
         }
 
         if (adminPassword.Length < 10)
@@ -326,24 +377,10 @@ public static class SeedData
 
         var tenantId = Guid.Parse("a3eb2579-63c9-4e34-9f13-d9f5f67ad001");
         var adminId = Guid.Parse("91b2fd19-2334-403a-a77a-2b907e8ad001");
-        var lawyerId = Guid.Parse("91b2fd19-2334-403a-a77a-2b907e8ad002");
-        var clientId = Guid.Parse("91b2fd19-2334-403a-a77a-2b907e8ad003");
-        var caseId = Guid.Parse("b86d4f8b-93bd-48d5-beca-26b9528ad001");
         var (adminHash, adminSalt) = hasher.HashPassword(adminPassword);
 
         store.Tenants.Add(new Tenant(tenantId, tenantName, now));
         store.Users.Add(new UserAccount(adminId, tenantId, adminEmail, "Admin LegalPilot", adminHash, adminSalt, [UserRole.SuperAdmin, UserRole.Lawyer], false, now));
-
-        if (!production)
-        {
-            var lawyerPassword = FirstConfigured(
-                Environment.GetEnvironmentVariable("LEGALPILOT_BOOTSTRAP_LAWYER_PASSWORD"),
-                configuration?["LegalPilot:Bootstrap:LawyerPassword"]) ?? "Abogado#2026";
-            var (lawyerHash, lawyerSalt) = hasher.HashPassword(lawyerPassword);
-            store.Users.Add(new UserAccount(lawyerId, tenantId, "abogado@legalpilot.ec", "Abogado Demo", lawyerHash, lawyerSalt, [UserRole.Lawyer], false, now));
-            store.Clients.Add(new ClientProfile(clientId, tenantId, "Cliente Demo", "cliente@example.com", "+593999000111", "0999999999", now));
-            store.Cases.Add(new LegalCase(caseId, tenantId, "Juicio de cobro - Cliente Demo", "17230-2026-00001", "Civil", "Unidad Judicial Civil de Quito", clientId, lawyerId, "Activo", now, now));
-        }
 
         foreach (var holiday in EcuadorHolidaySeed.National2026(tenantId))
         {
@@ -368,7 +405,723 @@ public static class SeedData
             true,
             now));
 
-        store.Audit(tenantId, adminId, AuditAction.Create, nameof(Tenant), tenantId.ToString(), production ? "Tenant inicializado por bootstrap productivo." : "Tenant demo inicializado.");
+        store.Audit(tenantId, adminId, AuditAction.Create, nameof(Tenant), tenantId.ToString(), "Tenant inicializado por bootstrap configurado.");
+    }
+
+    private static void EnsureConfiguredBootstrap(LegalPilotStore store, PasswordHasher hasher, IConfiguration? configuration, IWebHostEnvironment? environment)
+    {
+        var tenantName = FirstConfigured(
+            Environment.GetEnvironmentVariable("LEGALPILOT_BOOTSTRAP_TENANT_NAME"),
+            configuration?["LegalPilot:Bootstrap:TenantName"]);
+        var adminEmail = FirstConfigured(
+            Environment.GetEnvironmentVariable("LEGALPILOT_BOOTSTRAP_ADMIN_EMAIL"),
+            configuration?["LegalPilot:Bootstrap:AdminEmail"]);
+        var adminPassword = FirstConfigured(
+            Environment.GetEnvironmentVariable("LEGALPILOT_BOOTSTRAP_ADMIN_PASSWORD"),
+            configuration?["LegalPilot:Bootstrap:AdminPassword"]);
+
+        if (string.IsNullOrWhiteSpace(adminEmail) || string.IsNullOrWhiteSpace(adminPassword))
+        {
+            return;
+        }
+
+        if (adminPassword.Length < 10)
+        {
+            throw new InvalidOperationException("LEGALPILOT_BOOTSTRAP_ADMIN_PASSWORD debe tener al menos 10 caracteres.");
+        }
+
+        var tenant = store.Tenants.First();
+        if (!string.IsNullOrWhiteSpace(tenantName) &&
+            !tenant.Name.Equals(tenantName, StringComparison.Ordinal))
+        {
+            var tenantIndex = store.Tenants.FindIndex(t => t.Id == tenant.Id);
+            tenant = tenant with { Name = tenantName };
+            store.Tenants[tenantIndex] = tenant;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var (adminHash, adminSalt) = hasher.HashPassword(adminPassword);
+        if (store.PersistenceProvider == "postgresql")
+        {
+            var admin = UpsertBootstrapAdminInMemory(store, tenant.Id, adminEmail, adminHash, adminSalt, now);
+            var postgresPruned = RemoveKnownDemoRows(store, tenant.Id, adminEmail);
+            RepairTenantReferences(store, tenant.Id, admin.Id);
+            var audit = new AuditEntry(
+                Guid.NewGuid(),
+                tenant.Id,
+                null,
+                AuditAction.SecurityEvent,
+                nameof(UserAccount),
+                adminEmail,
+                postgresPruned
+                    ? "Bootstrap real aplicado y datos demo/QA removidos de PostgreSQL."
+                    : "Bootstrap real aplicado sobre PostgreSQL existente.",
+                new Dictionary<string, string>(),
+                DateTimeOffset.UtcNow);
+            store.AuditEntries.Insert(0, audit);
+            PersistPostgresBootstrap(configuration, tenant, admin, audit);
+            return;
+        }
+
+        var demoRemoved = false;
+        store.Write(() =>
+        {
+            var admin = UpsertBootstrapAdminInMemory(store, tenant.Id, adminEmail, adminHash, adminSalt, now);
+            demoRemoved = RemoveKnownDemoRows(store, tenant.Id, adminEmail);
+            RepairTenantReferences(store, tenant.Id, admin.Id);
+            store.AuditEntries.Insert(0, new AuditEntry(
+                Guid.NewGuid(),
+                tenant.Id,
+                null,
+                AuditAction.SecurityEvent,
+                nameof(UserAccount),
+                adminEmail,
+                demoRemoved
+                    ? "Bootstrap real aplicado y datos demo conocidos removidos."
+                    : "Bootstrap real aplicado sobre store existente.",
+                new Dictionary<string, string>(),
+                DateTimeOffset.UtcNow));
+        });
+    }
+
+    private static UserAccount UpsertBootstrapAdminInMemory(LegalPilotStore store, Guid tenantId, string adminEmail, string adminHash, string adminSalt, DateTimeOffset now)
+    {
+        var existingIndex = store.Users.FindIndex(u => u.Email.Equals(adminEmail, StringComparison.OrdinalIgnoreCase));
+        if (existingIndex >= 0)
+        {
+            var existing = store.Users[existingIndex];
+            var updated = existing with
+            {
+                TenantId = tenantId,
+                PasswordHash = adminHash,
+                PasswordSalt = adminSalt,
+                Roles = existing.Roles.Contains(UserRole.SuperAdmin)
+                    ? existing.Roles
+                    : existing.Roles.Append(UserRole.SuperAdmin).Append(UserRole.Lawyer).Distinct().ToArray(),
+                IsActive = true
+            };
+            store.Users[existingIndex] = updated;
+            return updated;
+        }
+
+        var admin = new UserAccount(
+            Guid.NewGuid(),
+            tenantId,
+            adminEmail,
+            "Admin LegalPilot",
+            adminHash,
+            adminSalt,
+            [UserRole.SuperAdmin, UserRole.Lawyer],
+            false,
+            now);
+        store.Users.Add(admin);
+        return admin;
+    }
+
+    private static void PersistPostgresBootstrap(IConfiguration? configuration, Tenant tenant, UserAccount admin, AuditEntry audit)
+    {
+        var rawConnection = FirstConfigured(
+            Environment.GetEnvironmentVariable("LEGALPILOT_DATABASE_URL"),
+            configuration?.GetConnectionString("LegalPilotPostgres"),
+            Environment.GetEnvironmentVariable("DATABASE_URL"));
+        if (string.IsNullOrWhiteSpace(rawConnection))
+        {
+            return;
+        }
+
+        var jsonOptions = new JsonSerializerOptions(JsonSerializerDefaults.Web)
+        {
+            Converters = { new JsonStringEnumConverter() }
+        };
+        using var connection = new NpgsqlConnection(NormalizePostgresConnectionString(rawConnection));
+        connection.Open();
+        using var transaction = connection.BeginTransaction();
+        try
+        {
+            using (var command = new NpgsqlCommand("""
+                INSERT INTO legalpilot_tenants
+                    (id, tenant_id, created_at, updated_at, status, name, payload)
+                VALUES
+                    (@id, @tenant_id, @created_at, NULL, @status, @name, CAST(@payload AS jsonb))
+                ON CONFLICT (id) DO UPDATE SET
+                    tenant_id = EXCLUDED.tenant_id,
+                    updated_at = now(),
+                    status = EXCLUDED.status,
+                    name = EXCLUDED.name,
+                    payload = EXCLUDED.payload;
+                """, connection, transaction))
+            {
+                command.Parameters.AddWithValue("id", tenant.Id);
+                command.Parameters.AddWithValue("tenant_id", tenant.Id);
+                command.Parameters.AddWithValue("created_at", tenant.CreatedAt.ToUniversalTime());
+                command.Parameters.AddWithValue("status", tenant.IsActive ? "Active" : "Inactive");
+                command.Parameters.AddWithValue("name", tenant.Name);
+                command.Parameters.AddWithValue("payload", JsonSerializer.Serialize(tenant, jsonOptions));
+                command.ExecuteNonQuery();
+            }
+
+            using (var command = new NpgsqlCommand("""
+                INSERT INTO legalpilot_users
+                    (id, tenant_id, created_at, updated_at, user_id, email, status, name, payload)
+                VALUES
+                    (@id, @tenant_id, @created_at, NULL, @user_id, @email, @status, @name, CAST(@payload AS jsonb))
+                ON CONFLICT (id) DO UPDATE SET
+                    tenant_id = EXCLUDED.tenant_id,
+                    updated_at = now(),
+                    user_id = EXCLUDED.user_id,
+                    email = EXCLUDED.email,
+                    status = EXCLUDED.status,
+                    name = EXCLUDED.name,
+                    payload = EXCLUDED.payload;
+                """, connection, transaction))
+            {
+                command.Parameters.AddWithValue("id", admin.Id);
+                command.Parameters.AddWithValue("tenant_id", admin.TenantId);
+                command.Parameters.AddWithValue("created_at", admin.CreatedAt.ToUniversalTime());
+                command.Parameters.AddWithValue("user_id", admin.Id);
+                command.Parameters.AddWithValue("email", admin.Email);
+                command.Parameters.AddWithValue("status", admin.IsActive ? "Active" : "Inactive");
+                command.Parameters.AddWithValue("name", admin.DisplayName);
+                command.Parameters.AddWithValue("payload", JsonSerializer.Serialize(admin, jsonOptions));
+                command.ExecuteNonQuery();
+            }
+
+            using (var command = new NpgsqlCommand("""
+                INSERT INTO legalpilot_audit_entries
+                    (id, tenant_id, created_at, updated_at, user_id, external_id, status, name, payload)
+                VALUES
+                    (@id, @tenant_id, @created_at, NULL, NULL, @external_id, @status, @name, CAST(@payload AS jsonb))
+                ON CONFLICT (id) DO NOTHING;
+                """, connection, transaction))
+            {
+                command.Parameters.AddWithValue("id", audit.Id);
+                command.Parameters.AddWithValue("tenant_id", audit.TenantId);
+                command.Parameters.AddWithValue("created_at", audit.CreatedAt.ToUniversalTime());
+                command.Parameters.AddWithValue("external_id", audit.EntityId);
+                command.Parameters.AddWithValue("status", audit.Action.ToString());
+                command.Parameters.AddWithValue("name", audit.EntityType);
+                command.Parameters.AddWithValue("payload", JsonSerializer.Serialize(audit, jsonOptions));
+                command.ExecuteNonQuery();
+            }
+
+            PrunePostgresDeadData(connection, transaction, tenant.Id, admin.Id, admin.Email);
+
+            transaction.Commit();
+        }
+        catch
+        {
+            transaction.Rollback();
+            throw;
+        }
+    }
+
+    private static void PrunePostgresDeadData(NpgsqlConnection connection, NpgsqlTransaction transaction, Guid tenantId, Guid adminId, string adminEmail)
+    {
+        using var command = new NpgsqlCommand("""
+            CREATE TEMP TABLE lp_dead_users ON COMMIT DROP AS
+            SELECT id
+            FROM legalpilot_users
+            WHERE tenant_id = @tenant_id
+              AND lower(coalesce(email, '') || ' ' || payload::text) LIKE ANY (ARRAY[
+                '%abogado@legalpilot.ec%',
+                '%admin@legalpilot.ec%',
+                '%cliente@example.com%',
+                '%cliente demo%',
+                '%abogado demo%'
+              ])
+              AND lower(coalesce(email, '')) <> lower(@admin_email);
+
+            CREATE TEMP TABLE lp_dead_clients ON COMMIT DROP AS
+            SELECT id
+            FROM legalpilot_clients
+            WHERE tenant_id = @tenant_id
+              AND lower(coalesce(name, '') || ' ' || coalesce(email, '') || ' ' || coalesce(external_id, '') || ' ' || payload::text) LIKE ANY (ARRAY[
+                '%cliente demo%',
+                '%cliente@example.com%',
+                '%0999999999%'
+              ]);
+
+            CREATE TEMP TABLE lp_dead_cases ON COMMIT DROP AS
+            SELECT id
+            FROM legalpilot_cases
+            WHERE tenant_id = @tenant_id
+              AND (
+                client_id IN (SELECT id FROM lp_dead_clients)
+                OR lower(coalesce(name, '') || ' ' || coalesce(case_number, '') || ' ' || payload::text) LIKE ANY (ARRAY[
+                  '%cliente demo%',
+                  '%17230-2026-00001%',
+                  '%qa supabase%',
+                  '%providencia qa%'
+                ])
+              );
+
+            CREATE TEMP TABLE lp_dead_emails ON COMMIT DROP AS
+            SELECT id
+            FROM legalpilot_emails
+            WHERE tenant_id = @tenant_id
+              AND (
+                case_id IN (SELECT id FROM lp_dead_cases)
+                OR lower(coalesce(name, '') || ' ' || coalesce(email, '') || ' ' || coalesce(external_id, '') || ' ' || payload::text) LIKE ANY (ARRAY[
+                  '%cliente demo%',
+                  '%qa supabase%',
+                  '%providencia qa%',
+                  '%17230-2026-00001%'
+                ])
+              );
+
+            CREATE TEMP TABLE lp_dead_deadlines ON COMMIT DROP AS
+            SELECT id
+            FROM legalpilot_deadlines
+            WHERE tenant_id = @tenant_id
+              AND (
+                case_id IN (SELECT id FROM lp_dead_cases)
+                OR legal_email_id IN (SELECT id FROM lp_dead_emails)
+                OR lower(coalesce(name, '') || ' ' || payload::text) LIKE ANY (ARRAY[
+                  '%cliente demo%',
+                  '%qa supabase%',
+                  '%providencia qa%',
+                  '%17230-2026-00001%'
+                ])
+              );
+
+            CREATE TEMP TABLE lp_dead_events ON COMMIT DROP AS
+            SELECT id
+            FROM legalpilot_calendar_events
+            WHERE tenant_id = @tenant_id
+              AND (
+                case_id IN (SELECT id FROM lp_dead_cases)
+                OR deadline_id IN (SELECT id FROM lp_dead_deadlines)
+                OR lower(coalesce(name, '') || ' ' || coalesce(external_id, '') || ' ' || payload::text) LIKE ANY (ARRAY[
+                  '%cliente demo%',
+                  '%qa supabase%',
+                  '%providencia qa%',
+                  '%17230-2026-00001%'
+                ])
+              );
+
+            CREATE TEMP TABLE lp_dead_ai_runs ON COMMIT DROP AS
+            SELECT id
+            FROM legalpilot_ai_processing_runs
+            WHERE tenant_id = @tenant_id
+              AND (
+                legal_email_id IN (SELECT id FROM lp_dead_emails)
+                OR lower(coalesce(name, '') || ' ' || coalesce(external_id, '') || ' ' || payload::text) LIKE ANY (ARRAY[
+                  '%cliente demo%',
+                  '%qa supabase%',
+                  '%providencia qa%',
+                  '%17230-2026-00001%'
+                ])
+              );
+
+            UPDATE legalpilot_mailboxes
+            SET user_id = @admin_id,
+                updated_at = now(),
+                payload = jsonb_set(payload, '{ownerUserId}', to_jsonb(CAST(@admin_id AS text)), false)
+            WHERE tenant_id = @tenant_id
+              AND user_id IN (SELECT id FROM lp_dead_users)
+              AND NOT (lower(coalesce(email, '') || ' ' || coalesce(name, '') || ' ' || payload::text) LIKE ANY (ARRAY[
+                '%cliente demo%',
+                '%qa supabase%',
+                '%providencia qa%',
+                '%abogado@legalpilot.ec%',
+                '%admin@legalpilot.ec%'
+              ]));
+
+            UPDATE legalpilot_cases
+            SET user_id = @admin_id,
+                updated_at = now(),
+                payload = jsonb_set(payload, '{responsibleUserId}', to_jsonb(CAST(@admin_id AS text)), false)
+            WHERE tenant_id = @tenant_id
+              AND user_id IN (SELECT id FROM lp_dead_users)
+              AND id NOT IN (SELECT id FROM lp_dead_cases);
+
+            UPDATE legalpilot_deadlines
+            SET user_id = @admin_id,
+                updated_at = now(),
+                payload = jsonb_set(payload, '{responsibleUserId}', to_jsonb(CAST(@admin_id AS text)), false)
+            WHERE tenant_id = @tenant_id
+              AND user_id IN (SELECT id FROM lp_dead_users)
+              AND id NOT IN (SELECT id FROM lp_dead_deadlines);
+
+            UPDATE legalpilot_calendar_events
+            SET user_id = @admin_id,
+                updated_at = now(),
+                payload = jsonb_set(payload, '{responsibleUserId}', to_jsonb(CAST(@admin_id AS text)), false)
+            WHERE tenant_id = @tenant_id
+              AND user_id IN (SELECT id FROM lp_dead_users)
+              AND id NOT IN (SELECT id FROM lp_dead_events);
+
+            DELETE FROM legalpilot_calendar_sync_logs
+            WHERE tenant_id = @tenant_id
+              AND (calendar_event_id IN (SELECT id FROM lp_dead_events)
+                   OR lower(coalesce(name, '') || ' ' || coalesce(external_id, '') || ' ' || payload::text) LIKE ANY (ARRAY['%qa supabase%', '%providencia qa%', '%cliente demo%', '%17230-2026-00001%']));
+
+            DELETE FROM legalpilot_reminders
+            WHERE tenant_id = @tenant_id
+              AND (calendar_event_id IN (SELECT id FROM lp_dead_events)
+                   OR lower(coalesce(name, '') || ' ' || payload::text) LIKE ANY (ARRAY['%qa supabase%', '%providencia qa%', '%cliente demo%', '%17230-2026-00001%']));
+
+            DELETE FROM legalpilot_notifications
+            WHERE tenant_id = @tenant_id
+              AND (user_id IN (SELECT id FROM lp_dead_users)
+                   OR lower(coalesce(name, '') || ' ' || payload::text) LIKE ANY (ARRAY['%qa supabase%', '%providencia qa%', '%cliente demo%', '%17230-2026-00001%', '%abogado demo%']));
+
+            DELETE FROM legalpilot_whatsapp_messages
+            WHERE tenant_id = @tenant_id
+              AND (client_id IN (SELECT id FROM lp_dead_clients)
+                   OR case_id IN (SELECT id FROM lp_dead_cases)
+                   OR lower(coalesce(name, '') || ' ' || coalesce(external_id, '') || ' ' || payload::text) LIKE ANY (ARRAY['%qa supabase%', '%providencia qa%', '%cliente demo%', '%17230-2026-00001%']));
+
+            DELETE FROM legalpilot_chat_messages
+            WHERE tenant_id = @tenant_id
+              AND (client_id IN (SELECT id FROM lp_dead_clients)
+                   OR case_id IN (SELECT id FROM lp_dead_cases)
+                   OR user_id IN (SELECT id FROM lp_dead_users)
+                   OR lower(coalesce(name, '') || ' ' || payload::text) LIKE ANY (ARRAY['%qa supabase%', '%providencia qa%', '%cliente demo%', '%17230-2026-00001%', '%abogado demo%']));
+
+            DELETE FROM legalpilot_ai_feedback_entries
+            WHERE tenant_id = @tenant_id
+              AND (user_id IN (SELECT id FROM lp_dead_users)
+                   OR external_id IN (SELECT id::text FROM lp_dead_ai_runs)
+                   OR lower(payload::text) LIKE ANY (ARRAY['%qa supabase%', '%providencia qa%', '%cliente demo%', '%17230-2026-00001%']));
+
+            DELETE FROM legalpilot_ai_processing_runs
+            WHERE tenant_id = @tenant_id
+              AND id IN (SELECT id FROM lp_dead_ai_runs);
+
+            DELETE FROM legalpilot_calendar_events
+            WHERE tenant_id = @tenant_id
+              AND id IN (SELECT id FROM lp_dead_events);
+
+            DELETE FROM legalpilot_deadlines
+            WHERE tenant_id = @tenant_id
+              AND id IN (SELECT id FROM lp_dead_deadlines);
+
+            DELETE FROM legalpilot_mail_processing_logs
+            WHERE tenant_id = @tenant_id
+              AND (mailbox_connection_id IN (
+                    SELECT id FROM legalpilot_mailboxes
+                    WHERE tenant_id = @tenant_id
+                      AND lower(coalesce(email, '') || ' ' || coalesce(name, '') || ' ' || payload::text) LIKE ANY (ARRAY['%abogado@legalpilot.ec%', '%admin@legalpilot.ec%', '%cliente demo%', '%qa supabase%', '%providencia qa%'])
+                  )
+                  OR legal_email_id IN (SELECT id FROM lp_dead_emails)
+                  OR lower(coalesce(name, '') || ' ' || payload::text) LIKE ANY (ARRAY['%qa supabase%', '%providencia qa%', '%cliente demo%', '%17230-2026-00001%']));
+
+            DELETE FROM legalpilot_mail_webhook_events
+            WHERE tenant_id = @tenant_id
+              AND lower(coalesce(name, '') || ' ' || coalesce(external_id, '') || ' ' || payload::text) LIKE ANY (ARRAY['%qa supabase%', '%providencia qa%', '%cliente demo%', '%17230-2026-00001%']);
+
+            DELETE FROM legalpilot_attachments
+            WHERE tenant_id = @tenant_id
+              AND (legal_email_id IN (SELECT id FROM lp_dead_emails)
+                   OR lower(coalesce(name, '') || ' ' || coalesce(external_id, '') || ' ' || payload::text) LIKE ANY (ARRAY['%qa supabase%', '%providencia qa%', '%cliente demo%', '%17230-2026-00001%']));
+
+            DELETE FROM legalpilot_emails
+            WHERE tenant_id = @tenant_id
+              AND id IN (SELECT id FROM lp_dead_emails);
+
+            DELETE FROM legalpilot_cases
+            WHERE tenant_id = @tenant_id
+              AND id IN (SELECT id FROM lp_dead_cases);
+
+            DELETE FROM legalpilot_clients
+            WHERE tenant_id = @tenant_id
+              AND id IN (SELECT id FROM lp_dead_clients);
+
+            DELETE FROM legalpilot_mailbox_sync_states
+            WHERE tenant_id = @tenant_id
+              AND mailbox_connection_id IN (
+                SELECT id FROM legalpilot_mailboxes
+                WHERE tenant_id = @tenant_id
+                  AND lower(coalesce(email, '') || ' ' || coalesce(name, '') || ' ' || payload::text) LIKE ANY (ARRAY['%abogado@legalpilot.ec%', '%admin@legalpilot.ec%', '%cliente demo%', '%qa supabase%', '%providencia qa%'])
+              );
+
+            DELETE FROM legalpilot_oauth_token_credentials
+            WHERE tenant_id = @tenant_id
+              AND mailbox_connection_id IN (
+                SELECT id FROM legalpilot_mailboxes
+                WHERE tenant_id = @tenant_id
+                  AND lower(coalesce(email, '') || ' ' || coalesce(name, '') || ' ' || payload::text) LIKE ANY (ARRAY['%abogado@legalpilot.ec%', '%admin@legalpilot.ec%', '%cliente demo%', '%qa supabase%', '%providencia qa%'])
+              );
+
+            DELETE FROM legalpilot_mailboxes
+            WHERE tenant_id = @tenant_id
+              AND lower(coalesce(email, '') || ' ' || coalesce(name, '') || ' ' || payload::text) LIKE ANY (ARRAY['%abogado@legalpilot.ec%', '%admin@legalpilot.ec%', '%cliente demo%', '%qa supabase%', '%providencia qa%']);
+
+            DELETE FROM legalpilot_password_reset_tickets
+            WHERE tenant_id = @tenant_id
+              AND user_id IN (SELECT id FROM lp_dead_users);
+
+            DELETE FROM legalpilot_refresh_token_sessions
+            WHERE tenant_id = @tenant_id
+              AND user_id IN (SELECT id FROM lp_dead_users);
+
+            DELETE FROM legalpilot_audit_entries
+            WHERE tenant_id = @tenant_id
+              AND (user_id IN (SELECT id FROM lp_dead_users)
+                   OR external_id IN (SELECT id::text FROM lp_dead_users)
+                   OR external_id IN (SELECT id::text FROM lp_dead_clients)
+                   OR external_id IN (SELECT id::text FROM lp_dead_cases)
+                   OR external_id IN (SELECT id::text FROM lp_dead_emails)
+                   OR external_id IN (SELECT id::text FROM lp_dead_deadlines)
+                   OR external_id IN (SELECT id::text FROM lp_dead_events)
+                   OR lower(coalesce(name, '') || ' ' || coalesce(external_id, '') || ' ' || payload::text) LIKE ANY (ARRAY['%qa supabase%', '%providencia qa%', '%cliente demo%', '%abogado demo%', '%17230-2026-00001%', '%abogado@legalpilot.ec%', '%admin@legalpilot.ec%']));
+
+            DELETE FROM legalpilot_users
+            WHERE tenant_id = @tenant_id
+              AND id IN (SELECT id FROM lp_dead_users);
+            """, connection, transaction);
+        command.Parameters.AddWithValue("tenant_id", tenantId);
+        command.Parameters.AddWithValue("admin_id", adminId);
+        command.Parameters.AddWithValue("admin_email", adminEmail);
+        command.ExecuteNonQuery();
+    }
+
+    private static string NormalizePostgresConnectionString(string raw)
+    {
+        if (raw.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase) ||
+            raw.StartsWith("postgresql://", StringComparison.OrdinalIgnoreCase))
+        {
+            var uri = new Uri(raw);
+            var userInfo = uri.UserInfo.Split(':', 2);
+            return new NpgsqlConnectionStringBuilder
+            {
+                Host = uri.Host,
+                Port = uri.Port > 0 ? uri.Port : 5432,
+                Database = uri.AbsolutePath.Trim('/'),
+                Username = Uri.UnescapeDataString(userInfo.ElementAtOrDefault(0) ?? string.Empty),
+                Password = Uri.UnescapeDataString(userInfo.ElementAtOrDefault(1) ?? string.Empty),
+                SslMode = SslMode.Require,
+                Pooling = true,
+                Timeout = 15,
+                CommandTimeout = 30,
+                IncludeErrorDetail = false
+            }.ConnectionString;
+        }
+
+        var builder = new NpgsqlConnectionStringBuilder(raw);
+        if (builder.SslMode is SslMode.Disable or SslMode.Prefer)
+        {
+            builder.SslMode = SslMode.Require;
+        }
+
+        builder.Pooling = true;
+        builder.IncludeErrorDetail = false;
+        return builder.ConnectionString;
+    }
+
+    private static bool RemoveKnownDemoRows(LegalPilotStore store, Guid tenantId, string adminEmail)
+    {
+        var demoUserEmails = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "abogado@legalpilot.ec"
+        };
+        if (!adminEmail.Equals("admin@legalpilot.ec", StringComparison.OrdinalIgnoreCase))
+        {
+            demoUserEmails.Add("admin@legalpilot.ec");
+        }
+
+        var demoClientIds = store.Clients
+            .Where(c => c.TenantId == tenantId &&
+                        (c.FullName.Equals("Cliente Demo", StringComparison.OrdinalIgnoreCase) ||
+                         c.Email.Equals("cliente@example.com", StringComparison.OrdinalIgnoreCase) ||
+                         c.Identification.Equals("0999999999", StringComparison.OrdinalIgnoreCase) ||
+                         LooksLikeDeadData(c.FullName, c.Email, c.Phone, c.Identification)))
+            .Select(c => c.Id)
+            .ToHashSet();
+        var demoCaseIds = store.Cases
+            .Where(c => c.TenantId == tenantId &&
+                        (c.Title.Contains("Cliente Demo", StringComparison.OrdinalIgnoreCase) ||
+                         c.CaseNumber.Equals("17230-2026-00001", StringComparison.OrdinalIgnoreCase) ||
+                         LooksLikeDeadData(c.Title, c.CaseNumber, c.Matter, c.CourtOrOffice) ||
+                         (c.ClientId.HasValue && demoClientIds.Contains(c.ClientId.Value))))
+            .Select(c => c.Id)
+            .ToHashSet();
+        var demoEmailIds = store.Emails
+            .Where(e => e.TenantId == tenantId &&
+                        ((e.CaseId.HasValue && demoCaseIds.Contains(e.CaseId.Value)) ||
+                         LooksLikeDeadData(e.Subject, e.Sender, e.BodyText, e.RawReference, e.ExternalMessageId, e.Extraction?.LawyerSummary, e.Extraction?.SuggestedDraft)))
+            .Select(e => e.Id)
+            .ToHashSet();
+        var demoDeadlineIds = store.Deadlines
+            .Where(d => d.TenantId == tenantId &&
+                        ((d.CaseId.HasValue && demoCaseIds.Contains(d.CaseId.Value)) ||
+                         (d.LegalEmailId.HasValue && demoEmailIds.Contains(d.LegalEmailId.Value)) ||
+                         LooksLikeDeadData(d.Title, d.Calculation.Explanation)))
+            .Select(d => d.Id)
+            .ToHashSet();
+        var demoEventIds = store.CalendarEvents
+            .Where(e => e.TenantId == tenantId &&
+                        ((e.CaseId.HasValue && demoCaseIds.Contains(e.CaseId.Value)) ||
+                         (e.DeadlineId.HasValue && demoDeadlineIds.Contains(e.DeadlineId.Value)) ||
+                         LooksLikeDeadData(e.Title, e.Location, e.Description, e.SyncError, e.ExternalEventId)))
+            .Select(e => e.Id)
+            .ToHashSet();
+        var demoAiRunIds = store.AiProcessingRuns
+            .Where(r => r.TenantId == tenantId &&
+                        ((r.LegalEmailId.HasValue && demoEmailIds.Contains(r.LegalEmailId.Value)) ||
+                         LooksLikeDeadData(r.OutputJson, r.InputHash, r.Purpose)))
+            .Select(r => r.Id)
+            .ToHashSet();
+        var before = CountDomainRows(store);
+
+        store.Users.RemoveAll(u => u.TenantId == tenantId && demoUserEmails.Contains(u.Email));
+        store.Clients.RemoveAll(c => c.TenantId == tenantId && demoClientIds.Contains(c.Id));
+        store.Cases.RemoveAll(c => c.TenantId == tenantId && demoCaseIds.Contains(c.Id));
+        store.Emails.RemoveAll(e => e.TenantId == tenantId && demoEmailIds.Contains(e.Id));
+        store.Attachments.RemoveAll(a => a.TenantId == tenantId && demoEmailIds.Contains(a.LegalEmailId));
+        store.MailProcessingLogs.RemoveAll(l => l.TenantId == tenantId && l.LegalEmailId.HasValue && demoEmailIds.Contains(l.LegalEmailId.Value));
+        store.MailWebhookEvents.RemoveAll(e => e.TenantId == tenantId && LooksLikeDeadData(e.Message, e.ExternalEventId));
+        store.Deadlines.RemoveAll(d => d.TenantId == tenantId && demoDeadlineIds.Contains(d.Id));
+        store.CalendarEvents.RemoveAll(e => e.TenantId == tenantId && demoEventIds.Contains(e.Id));
+        store.CalendarSyncLogs.RemoveAll(l => l.TenantId == tenantId && demoEventIds.Contains(l.CalendarEventId));
+        store.Reminders.RemoveAll(r => r.TenantId == tenantId && (demoEventIds.Contains(r.CalendarEventId) || LooksLikeDeadData(r.Message)));
+        store.Notifications.RemoveAll(n => n.TenantId == tenantId && LooksLikeDeadData(n.Title, n.Message));
+        store.WhatsAppMessages.RemoveAll(m => m.TenantId == tenantId &&
+                                             ((m.ClientId.HasValue && demoClientIds.Contains(m.ClientId.Value)) ||
+                                              (m.CaseId.HasValue && demoCaseIds.Contains(m.CaseId.Value)) ||
+                                              LooksLikeDeadData(m.Body, m.To)));
+        store.ChatMessages.RemoveAll(m => m.TenantId == tenantId &&
+                                          ((m.ClientId.HasValue && demoClientIds.Contains(m.ClientId.Value)) ||
+                                           (m.CaseId.HasValue && demoCaseIds.Contains(m.CaseId.Value)) ||
+                                           LooksLikeDeadData(m.Body, m.AuthorName)));
+        store.PasswordResetTickets.RemoveAll(t => t.TenantId == tenantId && store.Users.All(u => u.Id != t.UserId));
+        store.RefreshTokenSessions.RemoveAll(t => t.TenantId == tenantId && store.Users.All(u => u.Id != t.UserId));
+        store.AiProcessingRuns.RemoveAll(r => r.TenantId == tenantId && demoAiRunIds.Contains(r.Id));
+        store.AiFeedbackEntries.RemoveAll(f => f.TenantId == tenantId && ((f.AiRunId.HasValue && demoAiRunIds.Contains(f.AiRunId.Value)) || LooksLikeDeadData(f.CorrectionJson)));
+        store.AuditEntries.RemoveAll(a => a.TenantId == tenantId &&
+                                          (demoUserEmails.Contains(a.EntityId) ||
+                                           demoClientIds.Contains(ParseGuidOrEmpty(a.EntityId)) ||
+                                           demoCaseIds.Contains(ParseGuidOrEmpty(a.EntityId)) ||
+                                           demoEmailIds.Contains(ParseGuidOrEmpty(a.EntityId)) ||
+                                           demoDeadlineIds.Contains(ParseGuidOrEmpty(a.EntityId)) ||
+                                           demoEventIds.Contains(ParseGuidOrEmpty(a.EntityId)) ||
+                                           LooksLikeDeadData(a.Summary, a.EntityId, a.EntityType)));
+
+        var after = CountDomainRows(store);
+        return after < before;
+    }
+
+    private static int CountDomainRows(LegalPilotStore store)
+    {
+        return store.Users.Count + store.Clients.Count + store.Cases.Count + store.Emails.Count + store.Attachments.Count +
+               store.MailWebhookEvents.Count + store.MailProcessingLogs.Count + store.Deadlines.Count + store.CalendarEvents.Count +
+               store.CalendarSyncLogs.Count + store.Reminders.Count + store.Notifications.Count + store.WhatsAppMessages.Count +
+               store.ChatMessages.Count + store.AuditEntries.Count + store.AiProcessingRuns.Count + store.AiFeedbackEntries.Count;
+    }
+
+    private static Guid ParseGuidOrEmpty(string value)
+    {
+        return Guid.TryParse(value, out var parsed) ? parsed : Guid.Empty;
+    }
+
+    private static bool LooksLikeDeadData(params string?[] values)
+    {
+        var joined = string.Join(' ', values.Where(value => !string.IsNullOrWhiteSpace(value))).ToLowerInvariant();
+        if (joined.Length == 0)
+        {
+            return false;
+        }
+
+        return joined.Contains("cliente demo", StringComparison.OrdinalIgnoreCase) ||
+               joined.Contains("abogado demo", StringComparison.OrdinalIgnoreCase) ||
+               joined.Contains("cliente@example.com", StringComparison.OrdinalIgnoreCase) ||
+               joined.Contains("0999999999", StringComparison.OrdinalIgnoreCase) ||
+               joined.Contains("17230-2026-00001", StringComparison.OrdinalIgnoreCase) ||
+               joined.Contains("qa supabase", StringComparison.OrdinalIgnoreCase) ||
+               joined.Contains("providencia qa", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void RepairTenantReferences(LegalPilotStore store, Guid tenantId, Guid fallbackUserId)
+    {
+        var validUsers = store.Users.Where(u => u.TenantId == tenantId && u.IsActive).Select(u => u.Id).ToHashSet();
+        if (!validUsers.Contains(fallbackUserId))
+        {
+            fallbackUserId = validUsers.FirstOrDefault();
+        }
+
+        var validClients = store.Clients.Where(c => c.TenantId == tenantId).Select(c => c.Id).ToHashSet();
+        var validCases = store.Cases.Where(c => c.TenantId == tenantId).Select(c => c.Id).ToHashSet();
+        var validEmails = store.Emails.Where(e => e.TenantId == tenantId).Select(e => e.Id).ToHashSet();
+        var validDeadlines = store.Deadlines.Where(d => d.TenantId == tenantId).Select(d => d.Id).ToHashSet();
+
+        for (var i = 0; i < store.Cases.Count; i++)
+        {
+            var item = store.Cases[i];
+            if (item.TenantId != tenantId)
+            {
+                continue;
+            }
+
+            store.Cases[i] = item with
+            {
+                ClientId = item.ClientId.HasValue && validClients.Contains(item.ClientId.Value) ? item.ClientId : null,
+                ResponsibleUserId = validUsers.Contains(item.ResponsibleUserId) ? item.ResponsibleUserId : fallbackUserId
+            };
+        }
+
+        for (var i = 0; i < store.Mailboxes.Count; i++)
+        {
+            var item = store.Mailboxes[i];
+            if (item.TenantId == tenantId && !validUsers.Contains(item.OwnerUserId))
+            {
+                store.Mailboxes[i] = item with { OwnerUserId = fallbackUserId };
+            }
+        }
+
+        for (var i = 0; i < store.Deadlines.Count; i++)
+        {
+            var item = store.Deadlines[i];
+            if (item.TenantId != tenantId)
+            {
+                continue;
+            }
+
+            store.Deadlines[i] = item with
+            {
+                CaseId = item.CaseId.HasValue && validCases.Contains(item.CaseId.Value) ? item.CaseId : null,
+                LegalEmailId = item.LegalEmailId.HasValue && validEmails.Contains(item.LegalEmailId.Value) ? item.LegalEmailId : null,
+                ResponsibleUserId = validUsers.Contains(item.ResponsibleUserId) ? item.ResponsibleUserId : fallbackUserId
+            };
+        }
+
+        for (var i = 0; i < store.CalendarEvents.Count; i++)
+        {
+            var item = store.CalendarEvents[i];
+            if (item.TenantId != tenantId)
+            {
+                continue;
+            }
+
+            store.CalendarEvents[i] = item with
+            {
+                CaseId = item.CaseId.HasValue && validCases.Contains(item.CaseId.Value) ? item.CaseId : null,
+                DeadlineId = item.DeadlineId.HasValue && validDeadlines.Contains(item.DeadlineId.Value) ? item.DeadlineId : null,
+                ResponsibleUserId = validUsers.Contains(item.ResponsibleUserId) ? item.ResponsibleUserId : fallbackUserId
+            };
+        }
+
+        for (var i = 0; i < store.Notifications.Count; i++)
+        {
+            var item = store.Notifications[i];
+            if (item.TenantId == tenantId && !validUsers.Contains(item.UserId))
+            {
+                store.Notifications[i] = item with { UserId = fallbackUserId };
+            }
+        }
+
+        for (var i = 0; i < store.AiFeedbackEntries.Count; i++)
+        {
+            var item = store.AiFeedbackEntries[i];
+            if (item.TenantId == tenantId && !validUsers.Contains(item.UserId))
+            {
+                store.AiFeedbackEntries[i] = item with { UserId = fallbackUserId };
+            }
+        }
+
+        store.OAuthStateTickets.RemoveAll(t => t.TenantId == tenantId && !validUsers.Contains(t.UserId));
+        store.PasswordResetTickets.RemoveAll(t => t.TenantId == tenantId && !validUsers.Contains(t.UserId));
+        store.RefreshTokenSessions.RemoveAll(t => t.TenantId == tenantId && !validUsers.Contains(t.UserId));
     }
 
     private static string? FirstConfigured(params string?[] values)

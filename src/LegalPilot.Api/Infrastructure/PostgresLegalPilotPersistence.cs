@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using LegalPilot.Api.Application;
 using LegalPilot.Api.Domain;
 using Npgsql;
@@ -6,25 +7,30 @@ using NpgsqlTypes;
 
 namespace LegalPilot.Api.Infrastructure;
 
-public sealed class PostgresLegalPilotPersistence : ILegalPilotPersistence
+public sealed class PostgresLegalPilotPersistence : ILegalPilotPersistence, ILegalPilotIncrementalPersistence
 {
-    private const int CurrentMigration = 2;
+    private const int CurrentMigration = 3;
     private readonly string _connectionString;
     private readonly string _jsonMigrationPath;
     private readonly JsonSerializerOptions _jsonOptions;
     private readonly ILogger _logger;
+    private readonly bool _migrateLocalJson;
+    private readonly object _migrationGate = new();
+    private bool _migrationsApplied;
     private readonly string _safeDataSource;
 
     public PostgresLegalPilotPersistence(
         string rawConnectionString,
         string jsonMigrationPath,
         JsonSerializerOptions jsonOptions,
-        ILogger logger)
+        ILogger logger,
+        bool migrateLocalJson)
     {
         _connectionString = NormalizeConnectionString(rawConnectionString);
         _jsonMigrationPath = jsonMigrationPath;
         _jsonOptions = jsonOptions;
         _logger = logger;
+        _migrateLocalJson = migrateLocalJson;
         _safeDataSource = BuildSafeDataSource(_connectionString);
     }
 
@@ -36,9 +42,9 @@ public sealed class PostgresLegalPilotPersistence : ILegalPilotPersistence
     {
         using var connection = new NpgsqlConnection(_connectionString);
         connection.Open();
-        ApplyMigrations(connection);
+        EnsureMigrations(connection);
 
-        if (CountRows(connection, "legalpilot_tenants") == 0 && File.Exists(_jsonMigrationPath))
+        if (_migrateLocalJson && CountRows(connection, "legalpilot_tenants") == 0 && File.Exists(_jsonMigrationPath))
         {
             var migrated = TryLoadJsonSnapshot();
             if (migrated?.Tenants?.Count > 0)
@@ -61,9 +67,12 @@ public sealed class PostgresLegalPilotPersistence : ILegalPilotPersistence
             LoadTable<OAuthTokenCredential>(connection, "legalpilot_oauth_token_credentials", "updated_at DESC NULLS LAST"),
             LoadTable<LegalEmail>(connection, "legalpilot_emails", "created_at DESC NULLS LAST"),
             LoadTable<DocumentAttachment>(connection, "legalpilot_attachments", "created_at DESC NULLS LAST"),
+            LoadTable<MailWebhookEvent>(connection, "legalpilot_mail_webhook_events", "created_at DESC NULLS LAST"),
+            LoadTable<MailProcessingLog>(connection, "legalpilot_mail_processing_logs", "created_at DESC NULLS LAST"),
             LoadTable<Holiday>(connection, "legalpilot_holidays", "due_date ASC NULLS LAST"),
             LoadTable<Deadline>(connection, "legalpilot_deadlines", "due_date ASC NULLS LAST"),
             LoadTable<CalendarEvent>(connection, "legalpilot_calendar_events", "starts_at ASC NULLS LAST"),
+            LoadTable<CalendarSyncLog>(connection, "legalpilot_calendar_sync_logs", "created_at DESC NULLS LAST"),
             LoadTable<Reminder>(connection, "legalpilot_reminders", "starts_at ASC NULLS LAST"),
             LoadTable<Notification>(connection, "legalpilot_notifications", "created_at DESC NULLS LAST"),
             LoadTable<WhatsAppTemplate>(connection, "legalpilot_whatsapp_templates"),
@@ -81,16 +90,12 @@ public sealed class PostgresLegalPilotPersistence : ILegalPilotPersistence
     {
         using var connection = new NpgsqlConnection(_connectionString);
         connection.Open();
-        ApplyMigrations(connection);
+        EnsureMigrations(connection);
 
         using var transaction = connection.BeginTransaction();
         try
         {
             using var batch = new NpgsqlBatch(connection, transaction);
-            foreach (var table in DeleteOrder)
-            {
-                batch.BatchCommands.Add(new NpgsqlBatchCommand($"DELETE FROM {table};"));
-            }
 
             AppendTable(batch, "legalpilot_tenants", snapshot.Tenants ?? [], Row);
             AppendTable(batch, "legalpilot_users", snapshot.Users ?? [], Row);
@@ -102,9 +107,12 @@ public sealed class PostgresLegalPilotPersistence : ILegalPilotPersistence
             AppendTable(batch, "legalpilot_oauth_token_credentials", snapshot.OAuthTokenCredentials ?? [], Row);
             AppendTable(batch, "legalpilot_emails", snapshot.Emails ?? [], Row);
             AppendTable(batch, "legalpilot_attachments", snapshot.Attachments ?? [], Row);
+            AppendTable(batch, "legalpilot_mail_webhook_events", snapshot.MailWebhookEvents ?? [], Row);
+            AppendTable(batch, "legalpilot_mail_processing_logs", snapshot.MailProcessingLogs ?? [], Row);
             AppendTable(batch, "legalpilot_holidays", snapshot.Holidays ?? [], Row);
             AppendTable(batch, "legalpilot_deadlines", snapshot.Deadlines ?? [], Row);
             AppendTable(batch, "legalpilot_calendar_events", snapshot.CalendarEvents ?? [], Row);
+            AppendTable(batch, "legalpilot_calendar_sync_logs", snapshot.CalendarSyncLogs ?? [], Row);
             AppendTable(batch, "legalpilot_reminders", snapshot.Reminders ?? [], Row);
             AppendTable(batch, "legalpilot_notifications", snapshot.Notifications ?? [], Row);
             AppendTable(batch, "legalpilot_whatsapp_templates", snapshot.WhatsAppTemplates ?? [], Row);
@@ -135,10 +143,21 @@ public sealed class PostgresLegalPilotPersistence : ILegalPilotPersistence
         }
     }
 
+    public void PersistAuditEntry(AuditEntry entry)
+    {
+        PersistSingle("legalpilot_audit_entries", entry, Row);
+    }
+
+    public void PersistRefreshTokenSession(RefreshTokenSession session)
+    {
+        PersistSingle("legalpilot_refresh_token_sessions", session, Row);
+    }
+
     public object Diagnostics()
     {
         using var connection = new NpgsqlConnection(_connectionString);
         connection.Open();
+        EnsureMigrations(connection);
 
         using var tablesCommand = new NpgsqlCommand("""
             SELECT table_name
@@ -249,7 +268,7 @@ public sealed class PostgresLegalPilotPersistence : ILegalPilotPersistence
                 connection,
                 transaction);
             command.Parameters.AddWithValue("version", CurrentMigration);
-            command.Parameters.AddWithValue("name", "oauth_ai_and_idempotency_indexes");
+            command.Parameters.AddWithValue("name", "mail_calendar_sync_logs");
             command.ExecuteNonQuery();
             transaction.Commit();
         }
@@ -298,35 +317,121 @@ public sealed class PostgresLegalPilotPersistence : ILegalPilotPersistence
     {
         const string columns = "id, tenant_id, created_at, updated_at, user_id, case_id, client_id, mailbox_connection_id, legal_email_id, deadline_id, calendar_event_id, email, case_number, external_id, due_date, starts_at, status, provider, name, payload";
         var sql = $"""
+            WITH rows AS (
+                SELECT *
+                FROM jsonb_to_recordset(CAST(@rows AS jsonb)) AS x(
+                    id uuid,
+                    tenant_id uuid,
+                    created_at timestamptz,
+                    updated_at timestamptz,
+                    user_id uuid,
+                    case_id uuid,
+                    client_id uuid,
+                    mailbox_connection_id uuid,
+                    legal_email_id uuid,
+                    deadline_id uuid,
+                    calendar_event_id uuid,
+                    email text,
+                    case_number text,
+                    external_id text,
+                    due_date date,
+                    starts_at timestamptz,
+                    status text,
+                    provider text,
+                    name text,
+                    payload jsonb
+                )
+            )
             INSERT INTO {table} ({columns})
-            VALUES (@id, @tenant_id, @created_at, @updated_at, @user_id, @case_id, @client_id, @mailbox_connection_id, @legal_email_id, @deadline_id, @calendar_event_id, @email, @case_number, @external_id, @due_date, @starts_at, @status, @provider, @name, CAST(@payload AS jsonb));
+            SELECT {columns}
+            FROM rows
+            ON CONFLICT (id) DO UPDATE SET
+                tenant_id = EXCLUDED.tenant_id,
+                created_at = EXCLUDED.created_at,
+                updated_at = EXCLUDED.updated_at,
+                user_id = EXCLUDED.user_id,
+                case_id = EXCLUDED.case_id,
+                client_id = EXCLUDED.client_id,
+                mailbox_connection_id = EXCLUDED.mailbox_connection_id,
+                legal_email_id = EXCLUDED.legal_email_id,
+                deadline_id = EXCLUDED.deadline_id,
+                calendar_event_id = EXCLUDED.calendar_event_id,
+                email = EXCLUDED.email,
+                case_number = EXCLUDED.case_number,
+                external_id = EXCLUDED.external_id,
+                due_date = EXCLUDED.due_date,
+                starts_at = EXCLUDED.starts_at,
+                status = EXCLUDED.status,
+                provider = EXCLUDED.provider,
+                name = EXCLUDED.name,
+                payload = EXCLUDED.payload;
             """;
 
-        foreach (var item in items)
+        var rows = items
+            .Select(item =>
+            {
+                var row = map(item);
+                return new BulkPgRow<T>(
+                    row.Id,
+                    row.TenantId,
+                    row.CreatedAt?.ToUniversalTime(),
+                    row.UpdatedAt?.ToUniversalTime(),
+                    row.UserId,
+                    row.CaseId,
+                    row.ClientId,
+                    row.MailboxConnectionId,
+                    row.LegalEmailId,
+                    row.DeadlineId,
+                    row.CalendarEventId,
+                    row.Email,
+                    row.CaseNumber,
+                    row.ExternalId,
+                    row.DueDate,
+                    row.StartsAt?.ToUniversalTime(),
+                    row.Status,
+                    row.Provider,
+                    row.Name,
+                    item);
+            })
+            .ToArray();
+
+        if (rows.Length == 0)
         {
-            var row = map(item);
-            var command = new NpgsqlBatchCommand(sql);
-            Add(command.Parameters, "id", NpgsqlDbType.Uuid, row.Id);
-            Add(command.Parameters, "tenant_id", NpgsqlDbType.Uuid, row.TenantId);
-            Add(command.Parameters, "created_at", NpgsqlDbType.TimestampTz, row.CreatedAt);
-            Add(command.Parameters, "updated_at", NpgsqlDbType.TimestampTz, row.UpdatedAt);
-            Add(command.Parameters, "user_id", NpgsqlDbType.Uuid, row.UserId);
-            Add(command.Parameters, "case_id", NpgsqlDbType.Uuid, row.CaseId);
-            Add(command.Parameters, "client_id", NpgsqlDbType.Uuid, row.ClientId);
-            Add(command.Parameters, "mailbox_connection_id", NpgsqlDbType.Uuid, row.MailboxConnectionId);
-            Add(command.Parameters, "legal_email_id", NpgsqlDbType.Uuid, row.LegalEmailId);
-            Add(command.Parameters, "deadline_id", NpgsqlDbType.Uuid, row.DeadlineId);
-            Add(command.Parameters, "calendar_event_id", NpgsqlDbType.Uuid, row.CalendarEventId);
-            Add(command.Parameters, "email", NpgsqlDbType.Text, row.Email);
-            Add(command.Parameters, "case_number", NpgsqlDbType.Text, row.CaseNumber);
-            Add(command.Parameters, "external_id", NpgsqlDbType.Text, row.ExternalId);
-            Add(command.Parameters, "due_date", NpgsqlDbType.Date, row.DueDate);
-            Add(command.Parameters, "starts_at", NpgsqlDbType.TimestampTz, row.StartsAt);
-            Add(command.Parameters, "status", NpgsqlDbType.Text, row.Status);
-            Add(command.Parameters, "provider", NpgsqlDbType.Text, row.Provider);
-            Add(command.Parameters, "name", NpgsqlDbType.Text, row.Name);
-            Add(command.Parameters, "payload", NpgsqlDbType.Jsonb, JsonSerializer.Serialize(item, _jsonOptions));
-            batch.BatchCommands.Add(command);
+            return;
+        }
+
+        var command = new NpgsqlBatchCommand(sql);
+        Add(command.Parameters, "rows", NpgsqlDbType.Jsonb, JsonSerializer.Serialize(rows, _jsonOptions));
+        batch.BatchCommands.Add(command);
+    }
+
+    private void PersistSingle<T>(string table, T item, Func<T, PgRow> map)
+    {
+        using var connection = new NpgsqlConnection(_connectionString);
+        connection.Open();
+        EnsureMigrations(connection);
+
+        using var batch = new NpgsqlBatch(connection);
+        AppendTable(batch, table, [item], map);
+        batch.ExecuteNonQuery();
+    }
+
+    private void EnsureMigrations(NpgsqlConnection connection)
+    {
+        if (_migrationsApplied)
+        {
+            return;
+        }
+
+        lock (_migrationGate)
+        {
+            if (_migrationsApplied)
+            {
+                return;
+            }
+
+            ApplyMigrations(connection);
+            _migrationsApplied = true;
         }
     }
 
@@ -350,11 +455,17 @@ public sealed class PostgresLegalPilotPersistence : ILegalPilotPersistence
 
     private static PgRow Row(DocumentAttachment item) => new(item.Id, item.TenantId, item.CreatedAt, null, null, null, null, null, item.LegalEmailId, null, null, null, null, item.StorageKey, null, null, null, null, item.FileName);
 
+    private static PgRow Row(MailWebhookEvent item) => new(item.Id, item.TenantId, item.ReceivedAt, item.ProcessedAt, null, null, null, item.MailboxConnectionId, null, null, null, null, null, item.ExternalEventId, null, item.ProcessedAt, item.Status, item.Provider.ToString(), item.Message);
+
+    private static PgRow Row(MailProcessingLog item) => new(item.Id, item.TenantId, item.CreatedAt, null, null, null, null, item.MailboxConnectionId, item.LegalEmailId, null, null, null, null, null, null, item.NextAttemptAt, item.Status, item.Provider?.ToString(), item.Stage);
+
     private static PgRow Row(Holiday item) => new(item.Id, item.TenantId, item.CreatedAt, null, null, null, null, null, null, null, null, null, null, null, item.Date, null, item.Scope.ToString(), null, item.Name);
 
     private static PgRow Row(Deadline item) => new(item.Id, item.TenantId, item.CreatedAt, item.UpdatedAt, item.ResponsibleUserId, item.CaseId, null, null, item.LegalEmailId, item.Id, null, null, null, null, item.DueDate, null, item.Status.ToString(), null, item.Title);
 
     private static PgRow Row(CalendarEvent item) => new(item.Id, item.TenantId, item.CreatedAt, null, item.ResponsibleUserId, item.CaseId, null, null, null, item.DeadlineId, item.Id, null, null, item.ExternalEventId, null, item.StartsAt, item.Confirmed ? "Confirmed" : "Pending", item.ExternalProvider, item.Title);
+
+    private static PgRow Row(CalendarSyncLog item) => new(item.Id, item.TenantId, item.CreatedAt, null, null, null, null, null, null, null, item.CalendarEventId, null, null, item.ExternalEventId, null, item.NextAttemptAt, item.Status, item.Provider.ToString(), item.Operation);
 
     private static PgRow Row(Reminder item) => new(item.Id, item.TenantId, item.CreatedAt, null, null, null, null, null, null, null, item.CalendarEventId, null, null, null, null, item.SendAt, item.Status.ToString(), item.Channel.ToString(), item.Message);
 
@@ -465,6 +576,28 @@ public sealed class PostgresLegalPilotPersistence : ILegalPilotPersistence
         string? Provider,
         string? Name);
 
+    private sealed record BulkPgRow<T>(
+        [property: JsonPropertyName("id")] Guid Id,
+        [property: JsonPropertyName("tenant_id")] Guid? TenantId,
+        [property: JsonPropertyName("created_at")] DateTimeOffset? CreatedAt,
+        [property: JsonPropertyName("updated_at")] DateTimeOffset? UpdatedAt,
+        [property: JsonPropertyName("user_id")] Guid? UserId,
+        [property: JsonPropertyName("case_id")] Guid? CaseId,
+        [property: JsonPropertyName("client_id")] Guid? ClientId,
+        [property: JsonPropertyName("mailbox_connection_id")] Guid? MailboxConnectionId,
+        [property: JsonPropertyName("legal_email_id")] Guid? LegalEmailId,
+        [property: JsonPropertyName("deadline_id")] Guid? DeadlineId,
+        [property: JsonPropertyName("calendar_event_id")] Guid? CalendarEventId,
+        [property: JsonPropertyName("email")] string? Email,
+        [property: JsonPropertyName("case_number")] string? CaseNumber,
+        [property: JsonPropertyName("external_id")] string? ExternalId,
+        [property: JsonPropertyName("due_date")] DateOnly? DueDate,
+        [property: JsonPropertyName("starts_at")] DateTimeOffset? StartsAt,
+        [property: JsonPropertyName("status")] string? Status,
+        [property: JsonPropertyName("provider")] string? Provider,
+        [property: JsonPropertyName("name")] string? Name,
+        [property: JsonPropertyName("payload")] T Payload);
+
     private static readonly string[] InsertOrder =
     [
         "legalpilot_tenants",
@@ -477,9 +610,12 @@ public sealed class PostgresLegalPilotPersistence : ILegalPilotPersistence
         "legalpilot_oauth_token_credentials",
         "legalpilot_emails",
         "legalpilot_attachments",
+        "legalpilot_mail_webhook_events",
+        "legalpilot_mail_processing_logs",
         "legalpilot_holidays",
         "legalpilot_deadlines",
         "legalpilot_calendar_events",
+        "legalpilot_calendar_sync_logs",
         "legalpilot_reminders",
         "legalpilot_notifications",
         "legalpilot_whatsapp_templates",
@@ -492,8 +628,6 @@ public sealed class PostgresLegalPilotPersistence : ILegalPilotPersistence
         "legalpilot_ai_processing_runs",
         "legalpilot_ai_feedback_entries"
     ];
-
-    private static readonly string[] DeleteOrder = InsertOrder.Reverse().ToArray();
 
     private static readonly string[] ConstraintStatements =
     [
@@ -510,6 +644,9 @@ public sealed class PostgresLegalPilotPersistence : ILegalPilotPersistence
         Constraint("legalpilot_emails", "fk_emails_mailbox", "mailbox_connection_id", "legalpilot_mailboxes", "id"),
         Constraint("legalpilot_emails", "fk_emails_case", "case_id", "legalpilot_cases", "id"),
         Constraint("legalpilot_attachments", "fk_attachments_email", "legal_email_id", "legalpilot_emails", "id"),
+        Constraint("legalpilot_mail_webhook_events", "fk_mail_webhook_mailbox", "mailbox_connection_id", "legalpilot_mailboxes", "id"),
+        Constraint("legalpilot_mail_processing_logs", "fk_mail_logs_mailbox", "mailbox_connection_id", "legalpilot_mailboxes", "id"),
+        Constraint("legalpilot_mail_processing_logs", "fk_mail_logs_email", "legal_email_id", "legalpilot_emails", "id"),
         Constraint("legalpilot_holidays", "fk_holidays_tenant", "tenant_id", "legalpilot_tenants", "id"),
         Constraint("legalpilot_deadlines", "fk_deadlines_case", "case_id", "legalpilot_cases", "id"),
         Constraint("legalpilot_deadlines", "fk_deadlines_email", "legal_email_id", "legalpilot_emails", "id"),
@@ -517,6 +654,7 @@ public sealed class PostgresLegalPilotPersistence : ILegalPilotPersistence
         Constraint("legalpilot_calendar_events", "fk_events_case", "case_id", "legalpilot_cases", "id"),
         Constraint("legalpilot_calendar_events", "fk_events_deadline", "deadline_id", "legalpilot_deadlines", "id"),
         Constraint("legalpilot_calendar_events", "fk_events_responsible", "user_id", "legalpilot_users", "id"),
+        Constraint("legalpilot_calendar_sync_logs", "fk_calendar_sync_event", "calendar_event_id", "legalpilot_calendar_events", "id"),
         Constraint("legalpilot_reminders", "fk_reminders_event", "calendar_event_id", "legalpilot_calendar_events", "id"),
         Constraint("legalpilot_notifications", "fk_notifications_user", "user_id", "legalpilot_users", "id"),
         Constraint("legalpilot_whatsapp_messages", "fk_whatsapp_client", "client_id", "legalpilot_clients", "id"),
@@ -545,10 +683,13 @@ public sealed class PostgresLegalPilotPersistence : ILegalPilotPersistence
         "CREATE INDEX IF NOT EXISTS ix_legalpilot_oauth_tokens_mailbox ON legalpilot_oauth_token_credentials (mailbox_connection_id, status, starts_at);",
         "CREATE INDEX IF NOT EXISTS ix_legalpilot_emails_tenant_external ON legalpilot_emails (tenant_id, provider, external_id);",
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_legalpilot_emails_tenant_provider_external ON legalpilot_emails (tenant_id, provider, external_id) WHERE external_id IS NOT NULL;",
+        "CREATE INDEX IF NOT EXISTS ix_legalpilot_mail_webhook_tenant_hash ON legalpilot_mail_webhook_events (tenant_id, provider, external_id, status);",
+        "CREATE INDEX IF NOT EXISTS ix_legalpilot_mail_logs_tenant_created ON legalpilot_mail_processing_logs (tenant_id, created_at DESC);",
         "CREATE INDEX IF NOT EXISTS ix_legalpilot_deadlines_tenant_due ON legalpilot_deadlines (tenant_id, due_date, status);",
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_legalpilot_deadlines_email ON legalpilot_deadlines (tenant_id, legal_email_id) WHERE legal_email_id IS NOT NULL;",
         "CREATE INDEX IF NOT EXISTS ix_legalpilot_calendar_tenant_start ON legalpilot_calendar_events (tenant_id, starts_at);",
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_legalpilot_calendar_dedupe ON legalpilot_calendar_events (tenant_id, case_id, starts_at, lower(name)) WHERE starts_at IS NOT NULL;",
+        "CREATE INDEX IF NOT EXISTS ix_legalpilot_calendar_sync_tenant_created ON legalpilot_calendar_sync_logs (tenant_id, created_at DESC);",
         "CREATE INDEX IF NOT EXISTS ix_legalpilot_reminders_tenant_start ON legalpilot_reminders (tenant_id, starts_at, status);",
         "CREATE INDEX IF NOT EXISTS ix_legalpilot_notifications_tenant_status ON legalpilot_notifications (tenant_id, status, created_at DESC);",
         "CREATE INDEX IF NOT EXISTS ix_legalpilot_audit_tenant_created ON legalpilot_audit_entries (tenant_id, created_at DESC);",

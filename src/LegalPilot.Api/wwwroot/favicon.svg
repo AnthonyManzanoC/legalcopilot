@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="LegalPilot">
+  <rect width="64" height="64" rx="12" fill="#101820"/>
+  <path d="M18 44V16h7v22h20v6H18Z" fill="#f7f3ea"/>
+  <path d="M33 17h10c7 0 11 4 11 10s-4 10-11 10h-3v7h-7V17Zm9 14c3 0 5-1 5-4s-2-4-5-4h-2v8h2Z" fill="#2dd4bf"/>
+</svg>

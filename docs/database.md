@@ -6,7 +6,7 @@ LegalPilot usa PostgreSQL como fuente de verdad cuando existe una de estas varia
 - `ConnectionStrings__LegalPilotPostgres`
 
 No coloque cadenas reales de Supabase en el repositorio. Use variables de entorno, Secret Manager o secretos del proveedor de despliegue.
-En `Production`, LegalPilot no inicia sin PostgreSQL configurado; el fallback JSON queda reservado para desarrollo y pruebas locales.
+LegalPilot no inicia sin PostgreSQL configurado salvo que se desactive explicitamente con `LEGALPILOT_STORAGE_REQUIRE_POSTGRES=false`; el fallback JSON queda reservado para pruebas locales.
 
 ## Supabase
 
@@ -31,7 +31,7 @@ Al arrancar, `PostgresLegalPilotPersistence` aplica migraciones idempotentes:
 
 ## Migracion desde JSON
 
-Si PostgreSQL esta vacio y existe `App_Data/legalpilot-store.json`, el arranque importa ese snapshot a Supabase y despues opera sobre PostgreSQL. El archivo JSON queda como origen historico; la fuente activa se confirma en:
+El JSON local no se importa por defecto. Si necesita una migracion controlada desde `App_Data/legalpilot-store.json`, defina `LEGALPILOT_MIGRATE_LOCAL_JSON=true`; solo entonces, con PostgreSQL vacio, el arranque importa ese snapshot a Supabase y despues opera sobre PostgreSQL. La fuente activa se confirma en:
 
 ```text
 GET /health

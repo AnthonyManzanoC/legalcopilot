@@ -54,7 +54,11 @@ public sealed record MailboxConnection(
     DateTimeOffset ConnectedAt,
     DateTimeOffset? LastSyncAt,
     string? Cursor,
-    DateTimeOffset? WatchExpiresAt);
+    DateTimeOffset? WatchExpiresAt,
+    string? WebhookSubscriptionId = null,
+    DateTimeOffset? WebhookRenewedAt = null,
+    string? DefaultCalendarId = null,
+    string? LastError = null);
 
 public sealed record MailboxSyncState(
     Guid Id,
@@ -120,7 +124,10 @@ public sealed record LegalEmail(
     DateTimeOffset ReceivedAt,
     string ProcessingStatus,
     LegalExtraction? Extraction,
-    DateTimeOffset CreatedAt);
+    DateTimeOffset CreatedAt,
+    string MessageHash = "",
+    bool ProcessedWithFallback = false,
+    string? FallbackReason = null);
 
 public sealed record LegalExtraction(
     LegalActType ActType,
@@ -200,7 +207,51 @@ public sealed record CalendarEvent(
     bool Confirmed,
     string? ExternalProvider,
     string? ExternalEventId,
-    DateTimeOffset CreatedAt);
+    DateTimeOffset CreatedAt,
+    DateTimeOffset? UpdatedAt = null,
+    string Status = "Scheduled",
+    string SyncStatus = "Pending",
+    string? SyncError = null,
+    string? ExternalCalendarId = null,
+    string? Description = null);
+
+public sealed record MailWebhookEvent(
+    Guid Id,
+    Guid TenantId,
+    MailProvider Provider,
+    Guid? MailboxConnectionId,
+    string ExternalEventId,
+    string PayloadHash,
+    string Status,
+    string Message,
+    DateTimeOffset ReceivedAt,
+    DateTimeOffset? ProcessedAt);
+
+public sealed record MailProcessingLog(
+    Guid Id,
+    Guid TenantId,
+    Guid? MailboxConnectionId,
+    Guid? LegalEmailId,
+    MailProvider? Provider,
+    string Stage,
+    string Status,
+    string Message,
+    int Attempt,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset? NextAttemptAt);
+
+public sealed record CalendarSyncLog(
+    Guid Id,
+    Guid TenantId,
+    Guid CalendarEventId,
+    MailProvider Provider,
+    string Operation,
+    string Status,
+    string Message,
+    string? ExternalEventId,
+    int Attempt,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset? NextAttemptAt);
 
 public sealed record Reminder(
     Guid Id,

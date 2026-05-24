@@ -1,4 +1,5 @@
 using LegalPilot.Api.Domain;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
@@ -18,7 +19,10 @@ public sealed record MailboxSyncResult(
     bool Success,
     string Status,
     string Message,
-    DateTimeOffset? NextAttemptAt);
+    DateTimeOffset? NextAttemptAt,
+    string? Cursor = null,
+    DateTimeOffset? WatchExpiresAt = null,
+    string? SubscriptionId = null);
 
 public interface IEmailConnector
 {
@@ -60,7 +64,7 @@ public sealed class GmailEmailConnector(
 
     public IntegrationReadiness GetReadiness()
     {
-        var missing = Missing("LegalPilot:Gmail:ClientId", "LegalPilot:Gmail:ClientSecret", "LegalPilot:Gmail:RedirectUri");
+        var missing = Missing("LegalPilot:Gmail:ClientId", "LegalPilot:Gmail:ClientSecret", "LegalPilot:Gmail:RedirectUri", "LegalPilot:Gmail:PubSubTopicName");
         if (!secretProtector.Configured)
         {
             missing = [.. missing, "LEGALPILOT_DATA_PROTECTION_KEY"];
@@ -85,28 +89,54 @@ public sealed class GmailEmailConnector(
             return new MailboxSyncResult(false, access.Status, access.Message, DateTimeOffset.UtcNow.AddMinutes(30));
         }
 
-        var client = httpClientFactory.CreateClient("gmail");
-        using var listRequest = new HttpRequestMessage(HttpMethod.Get, "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=10&q=newer_than:14d");
-        listRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", access.Token);
-        using var listResponse = await client.SendAsync(listRequest, cancellationToken);
-        var listPayload = await listResponse.Content.ReadAsStringAsync(cancellationToken);
-        if (!listResponse.IsSuccessStatusCode)
+        var watch = await EnsureGmailWatchAsync(access.Token!, mailbox, cancellationToken);
+        var cursor = mailbox.Cursor;
+        if (string.IsNullOrWhiteSpace(cursor) && !string.IsNullOrWhiteSpace(watch.Cursor))
         {
-            logger.LogWarning("Gmail list failed for {Mailbox} with {Status}.", mailbox.Email, listResponse.StatusCode);
-            return new MailboxSyncResult(false, "ProviderSyncFailed", $"Gmail rechazo messages.list: {listResponse.StatusCode}.", DateTimeOffset.UtcNow.AddMinutes(15));
+            cursor = watch.Cursor;
         }
 
-        using var listDocument = JsonDocument.Parse(string.IsNullOrWhiteSpace(listPayload) ? "{}" : listPayload);
-        if (!listDocument.RootElement.TryGetProperty("messages", out var messages))
+        string[] messageIds;
+        string? nextCursor = cursor;
+        if (mailbox.LastSyncAt is not null && long.TryParse(cursor, out _))
         {
-            return new MailboxSyncResult(true, "Synced", "Gmail no devolvio mensajes nuevos.", DateTimeOffset.UtcNow.AddMinutes(15));
+            var history = await ListGmailHistoryAsync(access.Token!, cursor!, cancellationToken);
+            if (!history.Success)
+            {
+                if (history.Status == "GmailHistoryExpired")
+                {
+                    var fallbackList = await ListRecentGmailMessagesAsync(access.Token!, cancellationToken);
+                    if (fallbackList.Success)
+                    {
+                        messageIds = fallbackList.MessageIds;
+                        nextCursor = watch.Cursor ?? cursor;
+                        goto ProcessMessages;
+                    }
+                }
+
+                return new MailboxSyncResult(false, history.Status, history.Message, history.NextAttemptAt, cursor, watch.ExpiresAt, watch.SubscriptionId);
+            }
+
+            messageIds = history.MessageIds;
+            nextCursor = history.NextCursor ?? cursor;
+        }
+        else
+        {
+            var listed = await ListRecentGmailMessagesAsync(access.Token!, cancellationToken);
+            if (!listed.Success)
+            {
+                return new MailboxSyncResult(false, listed.Status, listed.Message, listed.NextAttemptAt, cursor, watch.ExpiresAt, watch.SubscriptionId);
+            }
+
+            messageIds = listed.MessageIds;
+            nextCursor = listed.NextCursor ?? nextCursor;
         }
 
+    ProcessMessages:
         var ingested = 0;
         var skipped = 0;
-        foreach (var message in messages.EnumerateArray())
+        foreach (var id in messageIds.Distinct(StringComparer.OrdinalIgnoreCase))
         {
-            var id = message.TryGetProperty("id", out var idElement) ? idElement.GetString() : null;
             if (string.IsNullOrWhiteSpace(id))
             {
                 continue;
@@ -122,23 +152,14 @@ public sealed class GmailEmailConnector(
                 continue;
             }
 
-            using var detailRequest = new HttpRequestMessage(HttpMethod.Get, $"https://gmail.googleapis.com/gmail/v1/users/me/messages/{Uri.EscapeDataString(id)}?format=full");
-            detailRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", access.Token);
-            using var detailResponse = await client.SendAsync(detailRequest, cancellationToken);
-            var detailPayload = await detailResponse.Content.ReadAsStringAsync(cancellationToken);
-            if (!detailResponse.IsSuccessStatusCode)
+            var messageResult = await IngestGmailMessageAsync(access.Token!, mailbox, id, cancellationToken);
+            if (messageResult)
             {
-                logger.LogWarning("Gmail message.get failed for {Mailbox} message {MessageId} with {Status}.", mailbox.Email, id, detailResponse.StatusCode);
-                continue;
+                ingested++;
             }
-
-            using var detailDocument = JsonDocument.Parse(detailPayload);
-            var envelope = await GmailMessageToEnvelopeAsync(access.Token!, id, detailDocument.RootElement, cancellationToken);
-            workflow.IngestWebhook(mailbox.TenantId, Provider, envelope);
-            ingested++;
         }
 
-        return new MailboxSyncResult(true, "Synced", $"Gmail sincronizado. Nuevos: {ingested}. Duplicados omitidos: {skipped}.", DateTimeOffset.UtcNow.AddMinutes(15));
+        return new MailboxSyncResult(true, "Synced", $"Gmail sincronizado. Nuevos: {ingested}. Duplicados omitidos: {skipped}.", DateTimeOffset.UtcNow.AddMinutes(15), nextCursor, watch.ExpiresAt, watch.SubscriptionId);
     }
 
     private async Task<TokenResolution> ResolveAccessTokenAsync(MailboxConnection mailbox, CancellationToken cancellationToken)
@@ -215,6 +236,138 @@ public sealed class GmailEmailConnector(
         }
 
         return EmailConnectorHelpers.ParseRefreshedToken(payload);
+    }
+
+    private async Task<GmailWatchState> EnsureGmailWatchAsync(string accessToken, MailboxConnection mailbox, CancellationToken cancellationToken)
+    {
+        if (mailbox.WatchExpiresAt.HasValue &&
+            mailbox.WatchExpiresAt.Value > DateTimeOffset.UtcNow.AddHours(24) &&
+            !string.IsNullOrWhiteSpace(mailbox.Cursor))
+        {
+            return new GmailWatchState(mailbox.Cursor, mailbox.WatchExpiresAt, mailbox.WebhookSubscriptionId ?? "gmail-watch");
+        }
+
+        var payload = new
+        {
+            topicName = Required("LegalPilot:Gmail:PubSubTopicName"),
+            labelIds = new[] { "INBOX" },
+            labelFilterAction = "include"
+        };
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, "https://gmail.googleapis.com/gmail/v1/users/me/watch");
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+        request.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+        using var response = await httpClientFactory.CreateClient("gmail-watch").SendAsync(request, cancellationToken);
+        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            logger.LogWarning("Gmail users.watch failed for {Mailbox} with {Status}.", mailbox.Email, response.StatusCode);
+            return new GmailWatchState(mailbox.Cursor, mailbox.WatchExpiresAt, mailbox.WebhookSubscriptionId);
+        }
+
+        using var document = JsonDocument.Parse(body);
+        var historyId = document.RootElement.TryGetProperty("historyId", out var history)
+            ? history.GetString()
+            : mailbox.Cursor;
+        var expiresAt = document.RootElement.TryGetProperty("expiration", out var expiration) &&
+                        long.TryParse(expiration.GetString(), out var millis)
+            ? DateTimeOffset.FromUnixTimeMilliseconds(millis)
+            : DateTimeOffset.UtcNow.AddDays(6);
+
+        store.Audit(mailbox.TenantId, mailbox.OwnerUserId, AuditAction.RenewSubscription, nameof(MailboxConnection), mailbox.Id.ToString(), "Gmail users.watch renovado.");
+        return new GmailWatchState(historyId, expiresAt, "gmail-watch");
+    }
+
+    private async Task<GmailListResult> ListGmailHistoryAsync(string accessToken, string startHistoryId, CancellationToken cancellationToken)
+    {
+        var client = httpClientFactory.CreateClient("gmail");
+        using var request = new HttpRequestMessage(HttpMethod.Get, $"https://gmail.googleapis.com/gmail/v1/users/me/history?startHistoryId={Uri.EscapeDataString(startHistoryId)}&historyTypes=messageAdded");
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+        using var response = await client.SendAsync(request, cancellationToken);
+        var payload = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            var delay = EmailConnectorHelpers.ProviderRetryDelay(response);
+            logger.LogWarning("Gmail history.list failed with {Status}.", response.StatusCode);
+            var status = response.StatusCode == HttpStatusCode.NotFound ? "GmailHistoryExpired" : "ProviderSyncFailed";
+            var message = response.StatusCode == HttpStatusCode.NotFound
+                ? "El cursor historyId de Gmail expiro; ejecute sincronizacion inicial para rehidratar mensajes recientes."
+                : $"Gmail rechazo history.list: {response.StatusCode}.";
+            return GmailListResult.Fail(status, message, delay);
+        }
+
+        using var document = JsonDocument.Parse(string.IsNullOrWhiteSpace(payload) ? "{}" : payload);
+        var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (document.RootElement.TryGetProperty("history", out var history))
+        {
+            foreach (var item in history.EnumerateArray())
+            {
+                if (!item.TryGetProperty("messagesAdded", out var added))
+                {
+                    continue;
+                }
+
+                foreach (var messageAdded in added.EnumerateArray())
+                {
+                    if (messageAdded.TryGetProperty("message", out var message) &&
+                        message.TryGetProperty("id", out var idElement) &&
+                        idElement.GetString() is { Length: > 0 } id)
+                    {
+                        ids.Add(id);
+                    }
+                }
+            }
+        }
+
+        var nextCursor = document.RootElement.TryGetProperty("historyId", out var historyId)
+            ? historyId.GetString()
+            : startHistoryId;
+        return GmailListResult.Ok(ids.ToArray(), nextCursor);
+    }
+
+    private async Task<GmailListResult> ListRecentGmailMessagesAsync(string accessToken, CancellationToken cancellationToken)
+    {
+        var client = httpClientFactory.CreateClient("gmail");
+        using var request = new HttpRequestMessage(HttpMethod.Get, "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=25&q=newer_than:14d");
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+        using var response = await client.SendAsync(request, cancellationToken);
+        var payload = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            logger.LogWarning("Gmail messages.list failed with {Status}.", response.StatusCode);
+            return GmailListResult.Fail("ProviderSyncFailed", $"Gmail rechazo messages.list: {response.StatusCode}.", EmailConnectorHelpers.ProviderRetryDelay(response));
+        }
+
+        using var document = JsonDocument.Parse(string.IsNullOrWhiteSpace(payload) ? "{}" : payload);
+        if (!document.RootElement.TryGetProperty("messages", out var messages))
+        {
+            return GmailListResult.Ok([], null);
+        }
+
+        var ids = messages.EnumerateArray()
+            .Select(message => message.TryGetProperty("id", out var idElement) ? idElement.GetString() : null)
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Cast<string>()
+            .ToArray();
+        return GmailListResult.Ok(ids, null);
+    }
+
+    private async Task<bool> IngestGmailMessageAsync(string accessToken, MailboxConnection mailbox, string id, CancellationToken cancellationToken)
+    {
+        using var detailRequest = new HttpRequestMessage(HttpMethod.Get, $"https://gmail.googleapis.com/gmail/v1/users/me/messages/{Uri.EscapeDataString(id)}?format=full");
+        detailRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+        using var detailResponse = await httpClientFactory.CreateClient("gmail").SendAsync(detailRequest, cancellationToken);
+        var detailPayload = await detailResponse.Content.ReadAsStringAsync(cancellationToken);
+        if (!detailResponse.IsSuccessStatusCode)
+        {
+            logger.LogWarning("Gmail message.get failed for {Mailbox} message {MessageId} with {Status}.", mailbox.Email, id, detailResponse.StatusCode);
+            return false;
+        }
+
+        using var detailDocument = JsonDocument.Parse(detailPayload);
+        var envelope = await GmailMessageToEnvelopeAsync(accessToken, id, detailDocument.RootElement, cancellationToken);
+        workflow.IngestWebhook(mailbox.TenantId, Provider, envelope with { MailboxConnectionId = mailbox.Id });
+        return true;
     }
 
     private async Task<WebhookEmailEnvelope> GmailMessageToEnvelopeAsync(string accessToken, string id, JsonElement root, CancellationToken cancellationToken)
@@ -393,7 +546,7 @@ public sealed class MicrosoftGraphEmailConnector(
 
     public IntegrationReadiness GetReadiness()
     {
-        var missing = Missing("LegalPilot:Microsoft:ClientId", "LegalPilot:Microsoft:ClientSecret", "LegalPilot:Microsoft:RedirectUri");
+        var missing = Missing("LegalPilot:Microsoft:ClientId", "LegalPilot:Microsoft:ClientSecret", "LegalPilot:Microsoft:RedirectUri", "LegalPilot:Microsoft:WebhookClientState", "LegalPilot:Microsoft:WebhookNotificationUrl");
         if (!secretProtector.Configured)
         {
             missing = [.. missing, "LEGALPILOT_DATA_PROTECTION_KEY"];
@@ -418,23 +571,33 @@ public sealed class MicrosoftGraphEmailConnector(
             return new MailboxSyncResult(false, access.Status, access.Message, DateTimeOffset.UtcNow.AddMinutes(30));
         }
 
+        var subscription = await EnsureGraphSubscriptionAsync(access.Token!, mailbox, cancellationToken);
+        var deltaUrl = mailbox.Cursor?.StartsWith("https://graph.microsoft.com/", StringComparison.OrdinalIgnoreCase) == true
+            ? mailbox.Cursor
+            : "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta?$top=25&$select=id,subject,from,toRecipients,bodyPreview,body,receivedDateTime,hasAttachments";
+
         var client = httpClientFactory.CreateClient("graph");
-        using var request = new HttpRequestMessage(HttpMethod.Get, "https://graph.microsoft.com/v1.0/me/messages?$top=10&$select=id,subject,from,toRecipients,bodyPreview,body,receivedDateTime&$orderby=receivedDateTime desc");
+        using var request = new HttpRequestMessage(HttpMethod.Get, deltaUrl);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", access.Token);
         using var response = await client.SendAsync(request, cancellationToken);
         var payload = await response.Content.ReadAsStringAsync(cancellationToken);
         if (!response.IsSuccessStatusCode)
         {
-            logger.LogWarning("Graph messages failed for {Mailbox} with {Status}.", mailbox.Email, response.StatusCode);
-            return new MailboxSyncResult(false, "ProviderSyncFailed", $"Microsoft Graph rechazo messages: {response.StatusCode}.", DateTimeOffset.UtcNow.AddMinutes(15));
+            logger.LogWarning("Graph delta messages failed for {Mailbox} with {Status}.", mailbox.Email, response.StatusCode);
+            return new MailboxSyncResult(false, "ProviderSyncFailed", $"Microsoft Graph rechazo messages delta: {response.StatusCode}.", EmailConnectorHelpers.ProviderRetryDelay(response), mailbox.Cursor, subscription.ExpiresAt, subscription.SubscriptionId);
         }
 
         using var document = JsonDocument.Parse(string.IsNullOrWhiteSpace(payload) ? "{}" : payload);
         if (!document.RootElement.TryGetProperty("value", out var messages))
         {
-            return new MailboxSyncResult(true, "Synced", "Microsoft Graph no devolvio mensajes nuevos.", DateTimeOffset.UtcNow.AddMinutes(15));
+            return new MailboxSyncResult(true, "Synced", "Microsoft Graph no devolvio mensajes nuevos.", DateTimeOffset.UtcNow.AddMinutes(15), mailbox.Cursor, subscription.ExpiresAt, subscription.SubscriptionId);
         }
 
+        var nextCursor = document.RootElement.TryGetProperty("@odata.deltaLink", out var deltaLink)
+            ? deltaLink.GetString()
+            : document.RootElement.TryGetProperty("@odata.nextLink", out var nextLink)
+                ? nextLink.GetString()
+                : mailbox.Cursor;
         var ingested = 0;
         var skipped = 0;
         foreach (var item in messages.EnumerateArray())
@@ -455,11 +618,12 @@ public sealed class MicrosoftGraphEmailConnector(
                 continue;
             }
 
-            workflow.IngestWebhook(mailbox.TenantId, Provider, await GraphMessageToEnvelopeAsync(access.Token!, id, item, cancellationToken));
+            var envelope = await GraphMessageToEnvelopeAsync(access.Token!, id, item, cancellationToken);
+            workflow.IngestWebhook(mailbox.TenantId, Provider, envelope with { MailboxConnectionId = mailbox.Id });
             ingested++;
         }
 
-        return new MailboxSyncResult(true, "Synced", $"Microsoft Graph sincronizado. Nuevos: {ingested}. Duplicados omitidos: {skipped}.", DateTimeOffset.UtcNow.AddMinutes(15));
+        return new MailboxSyncResult(true, "Synced", $"Microsoft Graph sincronizado. Nuevos: {ingested}. Duplicados omitidos: {skipped}.", DateTimeOffset.UtcNow.AddMinutes(15), nextCursor, subscription.ExpiresAt, subscription.SubscriptionId);
     }
 
     private async Task<TokenResolution> ResolveAccessTokenAsync(MailboxConnection mailbox, CancellationToken cancellationToken)
@@ -538,6 +702,51 @@ public sealed class MicrosoftGraphEmailConnector(
         }
 
         return EmailConnectorHelpers.ParseRefreshedToken(payload);
+    }
+
+    private async Task<GraphSubscriptionState> EnsureGraphSubscriptionAsync(string accessToken, MailboxConnection mailbox, CancellationToken cancellationToken)
+    {
+        if (mailbox.WatchExpiresAt.HasValue &&
+            mailbox.WatchExpiresAt.Value > DateTimeOffset.UtcNow.AddHours(12) &&
+            !string.IsNullOrWhiteSpace(mailbox.WebhookSubscriptionId))
+        {
+            return new GraphSubscriptionState(mailbox.WebhookSubscriptionId, mailbox.WatchExpiresAt);
+        }
+
+        var clientState = Required("LegalPilot:Microsoft:WebhookClientState");
+        var notificationUrl = Required("LegalPilot:Microsoft:WebhookNotificationUrl");
+        var expiresAt = DateTimeOffset.UtcNow.AddHours(68);
+        var payload = new
+        {
+            changeType = "created,updated",
+            notificationUrl,
+            resource = "me/messages",
+            expirationDateTime = expiresAt.UtcDateTime.ToString("O"),
+            clientState
+        };
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, "https://graph.microsoft.com/v1.0/subscriptions");
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+        request.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+        using var response = await httpClientFactory.CreateClient("graph-subscriptions").SendAsync(request, cancellationToken);
+        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            logger.LogWarning("Graph subscription renewal failed for {Mailbox} with {Status}.", mailbox.Email, response.StatusCode);
+            return new GraphSubscriptionState(mailbox.WebhookSubscriptionId, mailbox.WatchExpiresAt);
+        }
+
+        using var document = JsonDocument.Parse(body);
+        var id = document.RootElement.TryGetProperty("id", out var idElement)
+            ? idElement.GetString()
+            : mailbox.WebhookSubscriptionId;
+        var graphExpiresAt = document.RootElement.TryGetProperty("expirationDateTime", out var expirationElement) &&
+                             DateTimeOffset.TryParse(expirationElement.GetString(), out var parsed)
+            ? parsed
+            : expiresAt;
+
+        store.Audit(mailbox.TenantId, mailbox.OwnerUserId, AuditAction.RenewSubscription, nameof(MailboxConnection), mailbox.Id.ToString(), $"Microsoft Graph subscription renovada: {id}.");
+        return new GraphSubscriptionState(id, graphExpiresAt);
     }
 
     private async Task<WebhookEmailEnvelope> GraphMessageToEnvelopeAsync(string accessToken, string id, JsonElement item, CancellationToken cancellationToken)
@@ -728,6 +937,19 @@ public static class WebhookSecurity
 
 internal sealed record TokenResolution(bool Success, string Status, string Message, string? Token);
 
+internal sealed record GmailWatchState(string? Cursor, DateTimeOffset? ExpiresAt, string? SubscriptionId);
+
+internal sealed record GraphSubscriptionState(string? SubscriptionId, DateTimeOffset? ExpiresAt);
+
+internal sealed record GmailListResult(bool Success, string Status, string Message, DateTimeOffset? NextAttemptAt, string[] MessageIds, string? NextCursor)
+{
+    public static GmailListResult Ok(string[] messageIds, string? nextCursor) =>
+        new(true, "Synced", "Gmail devolvio mensajes para procesar.", DateTimeOffset.UtcNow.AddMinutes(15), messageIds, nextCursor);
+
+    public static GmailListResult Fail(string status, string message, DateTimeOffset nextAttemptAt) =>
+        new(false, status, message, nextAttemptAt, [], null);
+}
+
 internal sealed record RefreshedToken(
     string AccessToken,
     string? RefreshToken,
@@ -737,6 +959,23 @@ internal sealed record RefreshedToken(
 
 internal static class EmailConnectorHelpers
 {
+    public static DateTimeOffset ProviderRetryDelay(HttpResponseMessage response)
+    {
+        if (response.Headers.RetryAfter?.Delta is { } delta)
+        {
+            return DateTimeOffset.UtcNow.Add(delta);
+        }
+
+        if (response.Headers.RetryAfter?.Date is { } date)
+        {
+            return date;
+        }
+
+        return response.StatusCode is HttpStatusCode.TooManyRequests or HttpStatusCode.InternalServerError or HttpStatusCode.BadGateway or HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout
+            ? DateTimeOffset.UtcNow.AddMinutes(10)
+            : DateTimeOffset.UtcNow.AddMinutes(30);
+    }
+
     public static RefreshedToken ParseRefreshedToken(string payload)
     {
         using var document = JsonDocument.Parse(payload);

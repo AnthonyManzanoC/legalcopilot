@@ -130,7 +130,7 @@ Archivos actuales:
 - `Infrastructure/PostgresLegalPilotPersistence.cs`
 - `docs/database.md`
 
-Cuando `LEGALPILOT_DATABASE_URL` esta definido, PostgreSQL/Supabase es la fuente de verdad. Al iniciar, la aplicacion crea/aplica migraciones idempotentes, importa el JSON local si la base esta vacia y confirma estado en `/health` y `/api/status`.
+Cuando `LEGALPILOT_DATABASE_URL` esta definido, PostgreSQL/Supabase es la fuente de verdad. Al iniciar, la aplicacion crea/aplica migraciones idempotentes y confirma estado en `/health` y `/api/status`. El JSON local queda fuera por defecto; solo se importa si se define `LEGALPILOT_MIGRATE_LOCAL_JSON=true`.
 
 Sin esa variable, conserva fallback JSON atomico solo para desarrollo local y pruebas. En `Production`, el arranque falla si PostgreSQL no esta configurado.
 

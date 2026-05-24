@@ -85,19 +85,21 @@ static void TestWorkflowAuditReminderAndSanitization()
     var configuration = new ConfigurationBuilder()
         .AddInMemoryCollection(new Dictionary<string, string?>
         {
-            ["LegalPilot:Storage:Path"] = Path.Combine(tempRoot, "store.json")
+            ["LegalPilot:Storage:Path"] = Path.Combine(tempRoot, "store.json"),
+            ["LegalPilot:Bootstrap:AdminEmail"] = "admin@legalpilot.ec",
+            ["LegalPilot:Bootstrap:AdminPassword"] = "LegalPilot#2026"
         })
         .Build();
 
     var store = new LegalPilotStore(configuration, new TestEnvironment(tempRoot), loggerFactory.CreateLogger<LegalPilotStore>());
     var hasher = new PasswordHasher();
-    SeedData.Seed(store, hasher);
+    SeedData.Seed(store, hasher, configuration, new TestEnvironment(tempRoot));
 
     var admin = store.Users.First(u => u.Email == "admin@legalpilot.ec");
     var principal = new AuthPrincipal(admin.Id, admin.TenantId, admin.Email, admin.Roles);
     var clients = new ClientService(store);
     var cases = new CaseService(store);
-    var workflow = new LegalWorkflowService(store, new LegalIntelligenceService(), new EcuadorDeadlineEngine());
+    var workflow = new LegalWorkflowService(store, new LegalIntelligenceService(), new EcuadorDeadlineEngine(), configuration);
     var chat = new ChatService(store);
 
     var client = clients.Create(principal, new CreateClientRequest("Cliente Test", "cliente-test@example.com", "+593999222333", "TEST-001"));
@@ -121,13 +123,15 @@ static void TestIntegrationReadinessContracts()
     var configuration = new ConfigurationBuilder()
         .AddInMemoryCollection(new Dictionary<string, string?>
         {
-            ["LegalPilot:Storage:Path"] = Path.Combine(tempRoot, "store.json")
+            ["LegalPilot:Storage:Path"] = Path.Combine(tempRoot, "store.json"),
+            ["LegalPilot:Bootstrap:AdminEmail"] = "admin@legalpilot.ec",
+            ["LegalPilot:Bootstrap:AdminPassword"] = "LegalPilot#2026"
         })
         .Build();
     var environment = new TestEnvironment(tempRoot);
     var store = new LegalPilotStore(configuration, environment, loggerFactory.CreateLogger<LegalPilotStore>());
     SeedData.Seed(store, new PasswordHasher(), configuration, environment);
-    var workflow = new LegalWorkflowService(store, new LegalIntelligenceService(), new EcuadorDeadlineEngine());
+    var workflow = new LegalWorkflowService(store, new LegalIntelligenceService(), new EcuadorDeadlineEngine(), configuration);
     var secretProtector = new SecretProtector(configuration, environment);
     var httpClientFactory = new TestHttpClientFactory();
     var gmail = new GmailEmailConnector(configuration, loggerFactory.CreateLogger<GmailEmailConnector>(), store, workflow, secretProtector, httpClientFactory);
@@ -149,7 +153,9 @@ static void TestAiPipelineGuardrails()
     var configuration = new ConfigurationBuilder()
         .AddInMemoryCollection(new Dictionary<string, string?>
         {
-            ["LegalPilot:Storage:Path"] = Path.Combine(tempRoot, "store.json")
+            ["LegalPilot:Storage:Path"] = Path.Combine(tempRoot, "store.json"),
+            ["LegalPilot:Bootstrap:AdminEmail"] = "admin@legalpilot.ec",
+            ["LegalPilot:Bootstrap:AdminPassword"] = "LegalPilot#2026"
         })
         .Build();
     var environment = new TestEnvironment(tempRoot);

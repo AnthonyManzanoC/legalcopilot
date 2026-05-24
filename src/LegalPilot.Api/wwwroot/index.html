@@ -4,10 +4,11 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>LegalPilot Ecuador</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <main class="shell">
+  <main class="shell guest-shell">
     <aside class="sidebar hidden">
       <div class="brand">
         <div class="mark">LP</div>
@@ -55,7 +56,7 @@
           </div>
           <label>
             Correo
-            <input name="email" type="email" placeholder="abogado@estudio.ec" autocomplete="username" required>
+            <input name="email" type="email" placeholder="abogado@estudio.ec" autocomplete="username" autocapitalize="none" spellcheck="false" required>
           </label>
           <label>
             Contrasena
@@ -88,6 +89,13 @@
           <button type="button" class="ghost inline" id="backToLogin">Volver al login</button>
           <p id="forgotMessage" class="muted"></p>
         </form>
+
+        <aside id="publicStatus" class="login-status">
+          <div class="status-row">
+            <span>Backend</span>
+            <strong>Verificando</strong>
+          </div>
+        </aside>
       </section>
 
       <section id="appPanel" class="app-panel hidden">
@@ -97,7 +105,6 @@
             <section class="panel">
               <div class="panel-head">
                 <h2>Ingresar correo legal</h2>
-                <button id="demoEmailBtn" class="compact">Cargar demo</button>
               </div>
               <form id="manualEmailForm" class="grid-form">
                 <label>
@@ -502,10 +509,19 @@
                   Correo
                   <input name="email" type="email" placeholder="abogado@estudio.ec" required>
                 </label>
-                <button type="submit">Registrar buzon</button>
-                <button type="button" class="ghost inline" id="oauthStartBtn">Iniciar OAuth seguro</button>
+                <div id="oauthActions" class="oauth-actions">
+                  <button type="button" class="oauth-provider" data-oauth-provider="gmail">
+                    <strong>Conectar Gmail</strong>
+                    <span>OAuth seguro</span>
+                  </button>
+                  <button type="button" class="oauth-provider" data-oauth-provider="microsoft">
+                    <strong>Conectar Microsoft</strong>
+                    <span>OAuth seguro</span>
+                  </button>
+                </div>
+                <button type="submit" class="ghost inline">Registrar buzon manual</button>
               </form>
-              <div id="oauthBox" class="oauth-box muted">OAuth se habilita cuando Gmail/Microsoft tengan credenciales configuradas.</div>
+              <div id="oauthBox" class="oauth-box muted">Seleccione Gmail o Microsoft para conectar correo y calendario en vivo.</div>
               <div id="mailboxes" class="list"></div>
             </section>
             <section class="panel">

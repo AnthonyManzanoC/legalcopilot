@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Net;
@@ -6,6 +7,14 @@ using LegalPilot.Api.Domain;
 using LegalPilot.Api.Infrastructure;
 
 var builder = WebApplication.CreateBuilder(args);
+DotEnv.Load(builder.Environment.ContentRootPath, Directory.GetCurrentDirectory());
+builder.Configuration.AddEnvironmentVariables();
+builder.Configuration.AddInMemoryCollection(LegalPilotEnvironmentVariables.Build());
+var configuredUrls = Environment.GetEnvironmentVariable("ASPNETCORE_URLS") ?? builder.Configuration["Urls"];
+if (!string.IsNullOrWhiteSpace(configuredUrls))
+{
+    builder.WebHost.UseUrls(configuredUrls);
+}
 
 builder.Logging.ClearProviders();
 builder.Logging.AddSimpleConsole(options =>
@@ -152,6 +161,60 @@ app.MapPost("/api/auth/reset-password", (ResetPasswordRequest request, AuthServi
     return Results.Ok(auth.ResetPassword(request.Token, request.NewPassword));
 });
 
+app.MapGet("/api/auth/status", (LegalPilotStore store, IConfiguration configuration, EmailConnectorRegistry connectors, OpenWaClient openWa) =>
+{
+    var aiApiKeyConfigured = !string.IsNullOrWhiteSpace(configuration["LegalPilot:AI:ApiKey"]) ||
+                             !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GEMINI_API_KEY"));
+    var aiModel = string.IsNullOrWhiteSpace(configuration["LegalPilot:AI:Model"])
+        ? "gemini-2.5-flash"
+        : configuration["LegalPilot:AI:Model"];
+    var aiProvider = string.IsNullOrWhiteSpace(configuration["LegalPilot:AI:Provider"])
+        ? aiApiKeyConfigured ? "gemini" : "not-configured"
+        : configuration["LegalPilot:AI:Provider"];
+    var bootstrapMissing = ConfigurationDiagnostics.Missing(configuration,
+        "LegalPilot:Bootstrap:AdminEmail",
+        "LegalPilot:Bootstrap:AdminPassword");
+
+    return Results.Ok(store.Read(() => new
+    {
+        auth = new
+        {
+            ready = store.Users.Any(u => u.IsActive),
+            activeUsers = store.Users.Count(u => u.IsActive),
+            tenantCount = store.Tenants.Count,
+            bootstrapConfigured = bootstrapMissing.Length == 0,
+            bootstrapMissing
+        },
+        storage = new
+        {
+            provider = store.PersistenceProvider,
+            dataSource = store.DataFilePath
+        },
+        integrations = new
+        {
+            mail = connectors.Status().Select(item => new
+            {
+                item.Provider,
+                item.Configured,
+                item.Status,
+                item.Message,
+                item.RequiredSettings
+            }).ToArray(),
+            openWa = openWa.GetReadiness(),
+            ai = new
+            {
+                provider = aiProvider,
+                model = aiModel,
+                configured = aiApiKeyConfigured,
+                status = aiApiKeyConfigured ? "GeminiReady" : "GeminiApiKeyMissing",
+                message = aiApiKeyConfigured
+                    ? "Gemini esta configurado para analisis real."
+                    : "Configure GEMINI_API_KEY o LEGALPILOT_AI_API_KEY para usar Gemini."
+            }
+        }
+    }));
+});
+
 app.MapGet("/api/me", (HttpRequest request, TokenService tokens, LegalPilotStore store) =>
 {
     var principal = HttpAuth.RequirePrincipal(request, tokens);
@@ -263,6 +326,18 @@ app.MapPost("/api/mailboxes/{id:guid}/sync", async (HttpRequest request, TokenSe
 {
     var principal = HttpAuth.RequirePrincipal(request, tokens);
     return Results.Accepted($"/api/mailboxes/{id}/sync", await mailboxes.Sync(principal, id, cancellationToken));
+});
+
+app.MapPatch("/api/mailboxes/{id:guid}/calendar", (HttpRequest request, TokenService tokens, MailboxService mailboxes, Guid id, UpdateMailboxCalendarRequest payload) =>
+{
+    var principal = HttpAuth.RequirePrincipal(request, tokens);
+    return Results.Ok(mailboxes.UpdateCalendarPreference(principal, id, payload));
+});
+
+app.MapDelete("/api/mailboxes/{id:guid}", (HttpRequest request, TokenService tokens, MailboxService mailboxes, Guid id) =>
+{
+    var principal = HttpAuth.RequirePrincipal(request, tokens);
+    return Results.Ok(mailboxes.Disconnect(principal, id));
 });
 
 app.MapPost("/api/oauth/start", (HttpRequest request, TokenService tokens, OAuthService oauth, StartOAuthRequest payload) =>
@@ -444,6 +519,20 @@ app.MapPost("/api/calendar/events/{id:guid}/confirm", (HttpRequest request, Toke
     return Results.Ok(calendar.Confirm(principal, id));
 });
 
+app.MapPatch("/api/calendar/events/{id:guid}", (HttpRequest request, TokenService tokens, CalendarService calendar, Guid id, UpdateCalendarEventRequest payload) =>
+{
+    var principal = HttpAuth.RequirePrincipal(request, tokens);
+    return Results.Ok(calendar.Update(principal, id, payload));
+});
+
+app.MapDelete("/api/calendar/events/{id:guid}", async (HttpRequest request, TokenService tokens, CalendarService calendar, ExternalCalendarSyncService calendars, Guid id, CancellationToken cancellationToken) =>
+{
+    var principal = HttpAuth.RequirePrincipal(request, tokens);
+    var cancelled = calendar.Cancel(principal, id);
+    var sync = await calendars.SyncEventAsync(principal, id, cancellationToken);
+    return Results.Ok(new { eventItem = cancelled, sync });
+});
+
 app.MapPost("/api/calendar/events/{id:guid}/sync", async (HttpRequest request, TokenService tokens, ExternalCalendarSyncService calendars, Guid id, CancellationToken cancellationToken) =>
 {
     var principal = HttpAuth.RequirePrincipal(request, tokens);
@@ -598,8 +687,11 @@ app.MapGet("/api/status", (HttpRequest request, TokenService tokens, LegalPilotS
             calendar = calendarStatus,
             ai = new
             {
-                provider = configuration["LegalPilot:AI:Provider"] ?? "local-deterministic",
-                model = configuration["LegalPilot:AI:Model"] ?? "rules-v1",
+                provider = string.IsNullOrWhiteSpace(configuration["LegalPilot:AI:Provider"])
+                    ? (!string.IsNullOrWhiteSpace(configuration["LegalPilot:AI:ApiKey"]) ? "gemini" : "not-configured")
+                    : configuration["LegalPilot:AI:Provider"],
+                model = string.IsNullOrWhiteSpace(configuration["LegalPilot:AI:Model"]) ? "gemini-2.5-flash" : configuration["LegalPilot:AI:Model"],
+                configured = !string.IsNullOrWhiteSpace(configuration["LegalPilot:AI:ApiKey"]),
                 knowledgeDocuments = store.AiKnowledgeDocuments.Count(d => d.TenantId == principal.TenantId),
                 processingRuns = store.AiProcessingRuns.Count(r => r.TenantId == principal.TenantId)
             }
@@ -686,6 +778,164 @@ app.Run();
 
 public sealed record ReviewDeadlineRequest(bool Approved, string? Comment);
 public sealed record UpsertHolidayRequest(DateOnly Date, string Name, HolidayScope Scope, string? Province, string? Canton, string? Source, bool IsBusinessDayOverride);
+
+static class LegalPilotEnvironmentVariables
+{
+    private static readonly IReadOnlyDictionary<string, string> Map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["LEGALPILOT_TOKEN_SIGNING_KEY"] = "LegalPilot:TokenSigningKey",
+        ["LEGALPILOT_DATA_PROTECTION_KEY"] = "LegalPilot:Security:DataProtectionKey",
+        ["LEGALPILOT_BOOTSTRAP_TENANT_NAME"] = "LegalPilot:Bootstrap:TenantName",
+        ["LEGALPILOT_BOOTSTRAP_ADMIN_EMAIL"] = "LegalPilot:Bootstrap:AdminEmail",
+        ["LEGALPILOT_BOOTSTRAP_ADMIN_PASSWORD"] = "LegalPilot:Bootstrap:AdminPassword",
+        ["LEGALPILOT_BOOTSTRAP_LAWYER_PASSWORD"] = "LegalPilot:Bootstrap:LawyerPassword",
+        ["LEGALPILOT_STORAGE_PATH"] = "LegalPilot:Storage:Path",
+        ["LEGALPILOT_STORAGE_REQUIRE_POSTGRES"] = "LegalPilot:Storage:RequirePostgres",
+        ["LEGALPILOT_MIGRATE_LOCAL_JSON"] = "LegalPilot:Storage:MigrateLocalJson",
+        ["LEGALPILOT_GMAIL_CLIENT_ID"] = "LegalPilot:Gmail:ClientId",
+        ["LEGALPILOT_GMAIL_CLIENT_SECRET"] = "LegalPilot:Gmail:ClientSecret",
+        ["LEGALPILOT_GMAIL_REDIRECT_URI"] = "LegalPilot:Gmail:RedirectUri",
+        ["LEGALPILOT_GMAIL_WEBHOOK_SECRET"] = "LegalPilot:Gmail:WebhookSecret",
+        ["LEGALPILOT_GMAIL_PUBSUB_TOPIC_NAME"] = "LegalPilot:Gmail:PubSubTopicName",
+        ["LEGALPILOT_MICROSOFT_CLIENT_ID"] = "LegalPilot:Microsoft:ClientId",
+        ["LEGALPILOT_MICROSOFT_CLIENT_SECRET"] = "LegalPilot:Microsoft:ClientSecret",
+        ["LEGALPILOT_MICROSOFT_TENANT_ID"] = "LegalPilot:Microsoft:TenantId",
+        ["LEGALPILOT_MICROSOFT_REDIRECT_URI"] = "LegalPilot:Microsoft:RedirectUri",
+        ["LEGALPILOT_MICROSOFT_WEBHOOK_CLIENT_STATE"] = "LegalPilot:Microsoft:WebhookClientState",
+        ["LEGALPILOT_MICROSOFT_WEBHOOK_NOTIFICATION_URL"] = "LegalPilot:Microsoft:WebhookNotificationUrl",
+        ["LEGALPILOT_OPENWA_BASE_URL"] = "LegalPilot:OpenWa:BaseUrl",
+        ["LEGALPILOT_OPENWA_API_KEY"] = "LegalPilot:OpenWa:ApiKey",
+        ["LEGALPILOT_OPENWA_SESSION_ID"] = "LegalPilot:OpenWa:SessionId",
+        ["LEGALPILOT_OPENWA_WEBHOOK_SECRET"] = "LegalPilot:OpenWa:WebhookSecret",
+        ["LEGALPILOT_CALENDAR_PREFERRED_PROVIDER"] = "LegalPilot:Calendar:PreferredProvider",
+        ["LEGALPILOT_AI_PROVIDER"] = "LegalPilot:AI:Provider",
+        ["LEGALPILOT_AI_MODEL"] = "LegalPilot:AI:Model",
+        ["LEGALPILOT_AI_EMBEDDING_MODEL"] = "LegalPilot:AI:EmbeddingModel",
+        ["LEGALPILOT_AI_API_KEY"] = "LegalPilot:AI:ApiKey",
+        ["GEMINI_API_KEY"] = "LegalPilot:AI:ApiKey"
+    };
+
+    public static IReadOnlyDictionary<string, string?> Build()
+    {
+        return Map
+            .Select(pair => new KeyValuePair<string, string?>(pair.Value, Environment.GetEnvironmentVariable(pair.Key)))
+            .Where(pair => !string.IsNullOrWhiteSpace(pair.Value))
+            .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase);
+    }
+}
+
+static class DotEnv
+{
+    public static void Load(params string[] roots)
+    {
+        var candidates = roots
+            .Where(root => !string.IsNullOrWhiteSpace(root))
+            .Select(Path.GetFullPath)
+            .SelectMany(root => new[]
+            {
+                Path.Combine(root, ".env"),
+                Path.Combine(root, ".env.local"),
+                Path.Combine(root, "..", ".env"),
+                Path.Combine(root, "..", ".env.local"),
+                Path.Combine(root, "..", "..", ".env"),
+                Path.Combine(root, "..", "..", ".env.local")
+            })
+            .Select(Path.GetFullPath)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Where(File.Exists)
+            .ToArray();
+
+        var processValues = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        foreach (DictionaryEntry entry in Environment.GetEnvironmentVariables())
+        {
+            if (entry.Key is string key)
+            {
+                processValues[key] = entry.Value?.ToString();
+            }
+        }
+
+        var loadedByDotEnv = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var file in candidates)
+        {
+            var localFile = Path.GetFileName(file).Equals(".env.local", StringComparison.OrdinalIgnoreCase);
+            foreach (var line in File.ReadLines(file))
+            {
+                var parsed = ParseLine(line);
+                if (parsed is null)
+                {
+                    continue;
+                }
+
+                var (key, value) = parsed.Value;
+                var alreadyConfiguredByProcess = processValues.TryGetValue(key, out var existing) && !string.IsNullOrWhiteSpace(existing);
+                if (alreadyConfiguredByProcess && !loadedByDotEnv.Contains(key))
+                {
+                    continue;
+                }
+
+                if (!localFile && loadedByDotEnv.Contains(key))
+                {
+                    continue;
+                }
+
+                Environment.SetEnvironmentVariable(key, value);
+                loadedByDotEnv.Add(key);
+            }
+        }
+    }
+
+    private static (string Key, string Value)? ParseLine(string line)
+    {
+        var trimmed = line.Trim();
+        if (trimmed.Length == 0 || trimmed.StartsWith('#'))
+        {
+            return null;
+        }
+
+        if (trimmed.StartsWith("export ", StringComparison.OrdinalIgnoreCase))
+        {
+            trimmed = trimmed["export ".Length..].TrimStart();
+        }
+
+        var index = trimmed.IndexOf('=');
+        if (index <= 0)
+        {
+            return null;
+        }
+
+        var key = trimmed[..index].Trim();
+        var value = trimmed[(index + 1)..].Trim();
+        if (key.Length == 0)
+        {
+            return null;
+        }
+
+        value = Unquote(value);
+        return (key, value);
+    }
+
+    private static string Unquote(string value)
+    {
+        if (value.Length >= 2 &&
+            ((value[0] == '"' && value[^1] == '"') || (value[0] == '\'' && value[^1] == '\'')))
+        {
+            value = value[1..^1];
+        }
+
+        return value
+            .Replace("\\n", "\n", StringComparison.Ordinal)
+            .Replace("\\r", "\r", StringComparison.Ordinal)
+            .Replace("\\\"", "\"", StringComparison.Ordinal);
+    }
+}
+
+static class ConfigurationDiagnostics
+{
+    public static string[] Missing(IConfiguration configuration, params string[] keys)
+    {
+        return keys.Where(key => string.IsNullOrWhiteSpace(configuration[key])).ToArray();
+    }
+}
 
 static class MailProviderParser
 {

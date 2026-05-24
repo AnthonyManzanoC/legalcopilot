@@ -12,10 +12,15 @@ public sealed class LegalAiPipelineService(
 
     public object Status(AuthPrincipal principal)
     {
+        var provider = AiProvider();
+        var model = AiModel();
+        var geminiConfigured = GeminiConfigured();
         return store.Read(() => new
         {
-            provider = configuration["LegalPilot:AI:Provider"] ?? "local-deterministic",
-            model = configuration["LegalPilot:AI:Model"] ?? "rules-v1",
+            provider,
+            model,
+            configured = geminiConfigured,
+            status = geminiConfigured ? "GeminiReady" : "GeminiApiKeyMissing",
             rag = new
             {
                 documents = store.AiKnowledgeDocuments.Count(d => d.TenantId == principal.TenantId),
@@ -62,8 +67,8 @@ public sealed class LegalAiPipelineService(
             principal.TenantId,
             request.LegalEmailId,
             "classification-extraction-summary",
-            configuration["LegalPilot:AI:Provider"] ?? "local-deterministic",
-            configuration["LegalPilot:AI:Model"] ?? "rules-v1",
+            AiProvider(),
+            AiModel(),
             "Completed",
             TokenService.Sha256($"{subject}\n{body}"),
             JsonSerializer.Serialize(output, Json),
@@ -225,6 +230,29 @@ public sealed class LegalAiPipelineService(
             auditPromptsAndOutputs = true,
             piiProtection = "No enviar informacion sensible al cliente sin aprobacion del abogado."
         };
+    }
+
+    private string AiProvider()
+    {
+        var configured = configuration["LegalPilot:AI:Provider"];
+        if (!string.IsNullOrWhiteSpace(configured))
+        {
+            return configured;
+        }
+
+        return GeminiConfigured() ? "gemini" : "not-configured";
+    }
+
+    private string AiModel()
+    {
+        var configured = configuration["LegalPilot:AI:Model"];
+        return string.IsNullOrWhiteSpace(configured) ? "gemini-2.5-flash" : configured;
+    }
+
+    private bool GeminiConfigured()
+    {
+        return !string.IsNullOrWhiteSpace(configuration["LegalPilot:AI:ApiKey"]) ||
+               !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GEMINI_API_KEY"));
     }
 }
 

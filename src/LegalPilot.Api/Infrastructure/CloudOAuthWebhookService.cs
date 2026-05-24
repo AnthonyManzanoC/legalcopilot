@@ -216,22 +216,28 @@ public sealed class CloudOAuthWebhookService(
     {
         var microsoft = options.Value.Microsoft;
         var tenant = string.IsNullOrWhiteSpace(microsoft.TenantId) ? "common" : microsoft.TenantId;
-        var app = ConfidentialClientApplicationBuilder
-            .Create(Required(microsoft.ClientId, "LegalPilot:Microsoft:ClientId"))
-            .WithClientSecret(Required(microsoft.ClientSecret, "LegalPilot:Microsoft:ClientSecret"))
-            .WithRedirectUri(Required(microsoft.RedirectUri, "LegalPilot:Microsoft:RedirectUri"))
-            .WithAuthority(AzureCloudInstance.AzurePublic, tenant)
-            .Build();
+        var values = new Dictionary<string, string>
+        {
+            ["client_id"] = Required(microsoft.ClientId, "LegalPilot:Microsoft:ClientId"),
+            ["client_secret"] = Required(microsoft.ClientSecret, "LegalPilot:Microsoft:ClientSecret"),
+            ["redirect_uri"] = Required(microsoft.RedirectUri, "LegalPilot:Microsoft:RedirectUri"),
+            ["code"] = code,
+            ["grant_type"] = "authorization_code",
+            ["scope"] = string.Join(' ', OAuthService.Scopes(MailProvider.Outlook))
+        };
 
-        var result = await app.AcquireTokenByAuthorizationCode(OAuthService.Scopes(MailProvider.Outlook), code)
-            .ExecuteAsync(cancellationToken);
+        using var response = await httpClientFactory.CreateClient("graph-oauth").PostAsync(
+            $"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
+            new FormUrlEncodedContent(values),
+            cancellationToken);
+        var payload = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException($"Microsoft token endpoint rejected authorization code: {response.StatusCode}");
+        }
 
-        return new CloudTokenExchange(
-            result.AccessToken,
-            null,
-            "Bearer",
-            OAuthService.Scopes(MailProvider.Outlook),
-            result.ExpiresOn);
+        var parsed = EmailConnectorHelpers.ParseRefreshedToken(payload);
+        return new CloudTokenExchange(parsed.AccessToken, parsed.RefreshToken, parsed.TokenType, parsed.Scopes.Length == 0 ? OAuthService.Scopes(MailProvider.Outlook) : parsed.Scopes, parsed.ExpiresAt);
     }
 
     private (MailboxConnection Mailbox, OAuthTokenCredential Credential) StoreCredential(OAuthStateTicket ticket, CloudTokenExchange token)
@@ -255,7 +261,7 @@ public sealed class CloudOAuthWebhookService(
                     "Connected",
                     OAuthService.Scopes(ticket.Provider),
                     DateTimeOffset.UtcNow,
-                    DateTimeOffset.UtcNow,
+                    null,
                     null,
                     null);
                 store.Mailboxes.Add(mailbox);
@@ -266,7 +272,8 @@ public sealed class CloudOAuthWebhookService(
                 store.Mailboxes[mailboxIndex] = mailbox with
                 {
                     Status = "Connected",
-                    LastSyncAt = DateTimeOffset.UtcNow
+                    LastSyncAt = null,
+                    LastError = null
                 };
                 mailbox = store.Mailboxes[mailboxIndex];
             }
@@ -385,9 +392,12 @@ public sealed class CloudOAuthWebhookService(
                 store.Mailboxes[index] = store.Mailboxes[index] with
                 {
                     Status = "WebhookActive",
-                    Cursor = subscription.SubscriptionId,
+                    Cursor = mailbox.Provider == MailProvider.Gmail ? subscription.SubscriptionId : store.Mailboxes[index].Cursor,
+                    WebhookSubscriptionId = mailbox.Provider == MailProvider.Gmail ? "gmail-watch" : subscription.SubscriptionId,
                     WatchExpiresAt = subscription.ExpiresAt,
-                    LastSyncAt = DateTimeOffset.UtcNow
+                    WebhookRenewedAt = DateTimeOffset.UtcNow,
+                    LastSyncAt = null,
+                    LastError = null
                 };
             }
         });

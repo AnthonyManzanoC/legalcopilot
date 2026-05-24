@@ -9,7 +9,7 @@ LegalPilot Ecuador es un monolito modular ASP.NET Core para operar inbox legal, 
 - Autenticacion con access token, refresh token rotativo, logout y recuperacion de contrasena.
 - Roles base: `SuperAdmin`, `Lawyer`, `Assistant`, `Client`.
 - Persistencia real en PostgreSQL/Supabase via `Npgsql`; en `Production` es obligatoria por `LEGALPILOT_DATABASE_URL` o `ConnectionStrings__LegalPilotPostgres`.
-- Fallback local durable en JSON atomico solo para desarrollo/pruebas sin base externa.
+- Fallback local JSON solo para pruebas/desarrollo explicito con `LEGALPILOT_STORAGE_REQUIRE_POSTGRES=false`; el modo normal exige PostgreSQL/Supabase.
 - Migracion automatica desde JSON a PostgreSQL si la base esta vacia.
 - Motor deterministico de plazos Ecuador con sabados, domingos, feriados, feriados trasladados y excepciones de dia habil.
 - Ingesta manual de correos, webhooks Gmail/Microsoft, OAuth con exchange de token, `users.watch` Gmail y suscripciones Graph.
@@ -48,14 +48,14 @@ Abre:
 http://localhost:5056
 ```
 
-Credenciales demo:
+Antes de entrar por primera vez, configure credenciales reales en variables de entorno o en `.env` en la raiz del repo:
 
 ```text
-admin@legalpilot.ec
-LegalPilot#2026
-
-abogado@legalpilot.ec
-Abogado#2026
+LEGALPILOT_BOOTSTRAP_ADMIN_EMAIL=tu-correo@dominio.com
+LEGALPILOT_BOOTSTRAP_ADMIN_PASSWORD=una-contrasena-segura
+LEGALPILOT_TOKEN_SIGNING_KEY=secreto-aleatorio-de-64-caracteres
+LEGALPILOT_DATA_PROTECTION_KEY=secreto-aleatorio-de-32-caracteres-minimo
+GEMINI_API_KEY=tu-clave-gemini
 ```
 
 ## Pruebas
@@ -161,14 +161,14 @@ OpenWA usa `LegalPilot:OpenWa:BaseUrl`, `ApiKey`, `SessionId` y `WebhookSecret`.
 
 ## Persistencia y PostgreSQL
 
-La implementacion activa usa `Npgsql` y migraciones SQL idempotentes en `Infrastructure/PostgresLegalPilotPersistence.cs`. Crea tablas por agregado, columnas tipadas, `payload jsonb`, indices y relaciones principales. Configure Supabase con `LEGALPILOT_DATABASE_URL`; la aplicacion aplicara migraciones al iniciar y `/api/status` confirmara `provider = postgresql`.
+La implementacion activa usa `Npgsql` y migraciones SQL idempotentes en `Infrastructure/PostgresLegalPilotPersistence.cs`. Crea tablas por agregado, columnas tipadas, `payload jsonb`, indices y relaciones principales. Configure Supabase con `LEGALPILOT_DATABASE_URL`; la aplicacion aplicara migraciones al iniciar y `/api/status` confirmara `provider = postgresql`. El JSON local no se migra salvo que active `LEGALPILOT_MIGRATE_LOCAL_JSON=true`.
 
 Detalle operativo: [docs/database.md](docs/database.md).
 
 ## Flujo completo demo
 
-1. Iniciar API y entrar con `admin@legalpilot.ec`.
-2. Cargar demo en Tablero y procesar correo.
+1. Iniciar API y entrar con el usuario configurado por `LEGALPILOT_BOOTSTRAP_ADMIN_EMAIL`.
+2. Pegar o recibir un correo legal real y procesarlo.
 3. Revisar Inbox legal: clasificacion, causa, resumen y datos extraidos.
 4. Revisar Plazos: vence con calculo auditable y feriados Ecuador.
 5. Revisar Calendario y Recordatorios generados.

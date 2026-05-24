@@ -5,7 +5,8 @@ const state = {
   view: "dashboard",
   cases: [],
   clients: [],
-  users: []
+  users: [],
+  runtime: null
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -20,6 +21,13 @@ const escapeHtml = (value) => String(value ?? "")
   .replaceAll("\"", "&quot;");
 
 const toNullable = (value) => value ? value : emptyGuid;
+
+const setShellMode = (authenticated) => {
+  $(".shell").classList.toggle("guest-shell", !authenticated);
+  $(".shell").classList.toggle("app-shell", authenticated);
+  document.body.classList.toggle("guest", !authenticated);
+  document.body.classList.toggle("authenticated", authenticated);
+};
 
 const formatDateTime = (value) => {
   if (!value) return "-";
@@ -123,20 +131,69 @@ const loadReferences = async () => {
   bindReferenceSelects();
 };
 
+const loadPublicStatus = async () => {
+  const box = $("#publicStatus");
+  if (!box) return;
+
+  try {
+    const response = await fetch("/api/auth/status");
+    if (!response.ok) {
+      throw new Error("No se pudo leer el estado del backend.");
+    }
+
+    const status = await response.json();
+    state.runtime = status;
+    const mail = status.integrations?.mail || [];
+    const row = (label, value, detail, tag) => `
+      <article class="status-row">
+        <div>
+          <span>${escapeHtml(label)}</span>
+          ${detail ? `<p>${escapeHtml(detail)}</p>` : ""}
+        </div>
+        <strong class="${tagClass(tag || value)}">${escapeHtml(value)}</strong>
+      </article>
+    `;
+    const authDetail = status.auth?.ready
+      ? `${status.auth.activeUsers} usuario(s) activos.`
+      : `Faltan: ${(status.auth?.bootstrapMissing || []).join(", ") || "bootstrap admin"}`;
+
+    box.innerHTML = [
+      row("Acceso", status.auth?.ready ? "Listo" : "Sin bootstrap", authDetail, status.auth?.ready ? "Configured" : "ConfigurationMissing"),
+      row("Datos", status.storage?.provider || "-", status.storage?.provider === "postgresql" ? "Supabase/PostgreSQL conectado" : "Almacenamiento no productivo", status.storage?.provider === "postgresql" ? "Configured" : "Pending"),
+      ...mail.map((item) => row(item.provider, item.status, item.requiredSettings?.length ? `Faltan: ${item.requiredSettings.join(", ")}` : item.message, item.status)),
+      row("OpenWA", status.integrations?.openWa?.status || "-", status.integrations?.openWa?.requiredSettings?.join(", ") || status.integrations?.openWa?.message || "", status.integrations?.openWa?.status),
+      row("Gemini", status.integrations?.ai?.status || "-", `${status.integrations?.ai?.provider || "-"} / ${status.integrations?.ai?.model || "-"}`, status.integrations?.ai?.status)
+    ].join("");
+  } catch (error) {
+    box.innerHTML = `
+      <article class="status-row">
+        <div>
+          <span>Backend</span>
+          <p>${escapeHtml(error.message)}</p>
+        </div>
+        <strong class="high">Error</strong>
+      </article>
+    `;
+  }
+};
+
 const showApp = async () => {
   if (!state.token) {
+    setShellMode(false);
+    await loadPublicStatus();
     $("#loginPanel").classList.remove("hidden");
     $("#appPanel").classList.add("hidden");
     $(".sidebar").classList.add("hidden");
     $("#userBox").textContent = "Sin sesion";
-    $("#systemChip").textContent = "Sin sesion";
-    $("#systemChip").className = "status-chip";
+    $("#systemChip").textContent = state.runtime?.storage?.provider === "postgresql" ? "PostgreSQL activo" : "Sin sesion";
+    $("#systemChip").className = state.runtime?.storage?.provider === "postgresql" ? "status-chip ok" : "status-chip";
     return;
   }
 
   try {
     const me = await api("/api/me");
     state.user = me.user;
+    setShellMode(true);
     $("#loginPanel").classList.add("hidden");
     $("#appPanel").classList.remove("hidden");
     $(".sidebar").classList.remove("hidden");
@@ -149,6 +206,8 @@ const showApp = async () => {
     localStorage.removeItem("legalpilot.refresh");
     state.token = null;
     state.refreshToken = null;
+    setShellMode(false);
+    await loadPublicStatus();
     $("#loginError").textContent = error.message;
     $("#loginPanel").classList.remove("hidden");
     $("#appPanel").classList.add("hidden");
@@ -266,8 +325,14 @@ const loadMailboxes = async () => {
         <strong>${escapeHtml(mailbox.email)}</strong>
         <span class="tag ${tagClass(mailbox.status)}">${escapeHtml(mailbox.provider)}</span>
       </div>
-      <span>${escapeHtml(mailbox.status)} - Ultima revision: ${formatDateTime(mailbox.lastSyncAt)}</span>
-      <button class="compact fit" data-sync-mailbox="${mailbox.id}">Sincronizar</button>
+      <span>${escapeHtml(mailbox.status)} - Ultima revision: ${formatDateTime(mailbox.lastSyncAt)} - Watch: ${formatDateTime(mailbox.watchExpiresAt)}</span>
+      <p class="muted">Cursor: ${escapeHtml(mailbox.cursor || "-")} / Suscripcion: ${escapeHtml(mailbox.webhookSubscriptionId || "-")}${mailbox.lastError ? ` / Error: ${escapeHtml(mailbox.lastError)}` : ""}</p>
+      <div class="inline-grid">
+        <input aria-label="Calendario externo" placeholder="${mailbox.provider === "Gmail" ? "primary o id calendario Google" : "default o id calendario Outlook"}" value="${escapeHtml(mailbox.defaultCalendarId || "")}" data-calendar-id="${mailbox.id}">
+        <button class="compact" data-save-calendar="${mailbox.id}">Guardar calendario</button>
+        <button class="compact" data-sync-mailbox="${mailbox.id}">Sincronizar</button>
+        <button class="compact ghost inline" data-disconnect-mailbox="${mailbox.id}">Desconectar</button>
+      </div>
     </article>
   `).join("") : `<p class="muted">No hay buzones registrados.</p>`;
 };
@@ -285,20 +350,80 @@ const loadIntegrations = async () => {
     `${item.message}${item.requiredSettings?.length ? " Faltan: " + item.requiredSettings.join(", ") : ""}`,
     item.status
   )).join("");
+  updateOAuthButtons(status.mail || []);
   const openWa = itemTemplate("OpenWA", status.openWa.status, status.openWa.requiredSettings.join(", "), status.openWa.status);
   const calendar = status.calendar ? itemTemplate(
     "Calendario externo",
     status.calendar.status,
-    `${status.calendar.confirmedUnsyncedEvents ?? 0} eventos confirmados pendientes de sync. Proveedor: ${status.calendar.preferredProvider || "auto"}.`,
+    `${status.calendar.confirmedUnsyncedEvents ?? 0} pendientes, ${status.calendar.pendingDeletes ?? 0} eliminaciones. Proveedor: ${status.calendar.preferredProvider || "auto"}.`,
     status.calendar.configured ? "Configured" : status.calendar.status
   ) : "";
   $("#integrationStatus").innerHTML = mail + openWa + calendar;
-  $("#syncStates").innerHTML = syncStates.length ? syncStates.slice(0, 8).map((entry) => itemTemplate(
+  const calendarLogs = (status.calendar?.recentLogs || []).map((entry) => itemTemplate(
+    `${entry.provider} calendario ${entry.operation}`,
+    formatDateTime(entry.createdAt),
+    `${entry.message} Intento: ${entry.attempt}`,
+    entry.status
+  )).join("");
+  $("#syncStates").innerHTML = (syncStates.length ? syncStates.slice(0, 8).map((entry) => itemTemplate(
     `${entry.provider} sync`,
     formatDateTime(entry.checkedAt),
     `${entry.message} Fallos: ${entry.failureCount}`,
     entry.status
-  )).join("") : `<p class="muted">Sin intentos de sincronizacion.</p>`;
+  )).join("") : `<p class="muted">Sin intentos de sincronizacion.</p>`) + calendarLogs;
+};
+
+const updateOAuthButtons = (mailStatus) => {
+  $$("[data-oauth-provider]").forEach((button) => {
+    const provider = button.dataset.oauthProvider;
+    const expected = provider === "gmail" ? "Gmail" : "Outlook";
+    const item = mailStatus.find((entry) => String(entry.provider).toLowerCase() === expected.toLowerCase());
+    const configured = item?.configured !== false && !item?.requiredSettings?.length;
+    const label = provider === "gmail" ? "Conectar Gmail" : "Conectar Microsoft";
+    button.disabled = !configured;
+    button.innerHTML = `
+      <strong>${escapeHtml(label)}</strong>
+      <span>${escapeHtml(configured ? (item?.status || "OAuthReady") : "Configurar credenciales")}</span>
+    `;
+  });
+};
+
+const startOAuth = async (provider, button) => {
+  const form = new FormData($("#mailboxForm"));
+  const email = String(form.get("email") || state.user?.email || "").trim();
+  if (!email) {
+    throw new Error("Ingrese el correo que va a conectar.");
+  }
+
+  const popup = window.open("about:blank", "_blank", "noopener");
+  const original = button.innerHTML;
+  button.disabled = true;
+  button.innerHTML = "<strong>Abriendo OAuth</strong><span>Espere...</span>";
+  try {
+    const result = await api(`/api/auth/${provider}/login?email=${encodeURIComponent(email)}&mode=json`, { method: "GET" });
+    $("#oauthBox").innerHTML = `
+      <strong>OAuth listo para ${escapeHtml(result.provider)}</strong>
+      <span>${escapeHtml(result.email)} - expira: ${formatDateTime(result.expiresAt)}</span>
+      <span>Al aceptar, se guardan tokens cifrados y queda activo el webhook del proveedor.</span>
+      <a href="${escapeHtml(result.authorizationUrl)}" target="_blank" rel="noreferrer">Abrir autorizacion del proveedor</a>
+    `;
+    if (popup) {
+      popup.location.href = result.authorizationUrl;
+    }
+    $("#oauthBox").className = "oauth-box";
+    showToast(`OAuth ${result.provider} preparado.`);
+  } catch (error) {
+    if (popup) {
+      popup.close();
+    }
+    $("#oauthBox").textContent = error.message;
+    $("#oauthBox").className = "oauth-box error";
+    showToast(error.message, "error");
+  } finally {
+    button.disabled = false;
+    button.innerHTML = original;
+    await loadIntegrations();
+  }
 };
 
 const loadReports = async () => {
@@ -407,11 +532,13 @@ const loadCalendar = async () => {
         <strong>${escapeHtml(event.title)}</strong>
         <span class="tag ${event.confirmed ? "ok" : ""}">${escapeHtml(event.type)}</span>
       </div>
-      <span>${formatDateTime(event.startsAt)} - ${event.confirmed ? "Confirmado" : "Pendiente"}</span>
-      <p>${escapeHtml(event.location || "Sin ubicacion")} ${event.externalEventId ? `- externo: ${escapeHtml(event.externalProvider)}` : ""}</p>
+      <span>${formatDateTime(event.startsAt)} - ${event.confirmed ? "Confirmado" : "Pendiente"} - ${escapeHtml(event.status || "Scheduled")}</span>
+      <p>${escapeHtml(event.location || "Sin ubicacion")} ${event.externalEventId ? `- externo: ${escapeHtml(event.externalProvider)} / ${escapeHtml(event.externalEventId)}` : ""}</p>
+      <p class="muted">Sync: ${escapeHtml(event.syncStatus || "Pending")}${event.syncError ? ` - ${escapeHtml(event.syncError)}` : ""}</p>
       <div class="actions">
         ${event.confirmed ? "" : `<button class="compact fit" data-confirm-event="${event.id}">Confirmar</button>`}
-        ${event.confirmed && !event.externalEventId ? `<button class="compact ghost inline" data-sync-event="${event.id}">Sincronizar externo</button>` : ""}
+        ${event.confirmed && event.status !== "Cancelled" ? `<button class="compact ghost inline" data-sync-event="${event.id}">Sincronizar externo</button>` : ""}
+        ${event.status === "Cancelled" ? "" : `<button class="compact ghost inline" data-cancel-event="${event.id}">Cancelar</button>`}
       </div>
     </article>
   `).join("") : `<p class="muted">No hay eventos.</p>`;
@@ -651,24 +778,13 @@ $$("[data-refresh]").forEach((button) => {
   button.addEventListener("click", () => refreshView(button.dataset.refresh));
 });
 
-$("#demoEmailBtn").addEventListener("click", () => {
-  $("#manualEmailForm [name='subject']").value = "Providencia causa 17230-2026-00001 - termino de 5 dias";
-  $("#manualEmailForm [name='bodyText']").value = [
-    "Unidad Judicial Civil de Quito",
-    "Causa 17230-2026-00001",
-    "Se notifica providencia. Se concede el termino de 5 dias para que la parte actora presente la documentacion requerida.",
-    "Audiencia convocada para el 10/06/2026 a las 09:30 en sala 3.",
-    "Comparezca y cumpla lo dispuesto."
-  ].join("\n");
-});
-
 $("#manualEmailForm").addEventListener("submit", (event) => submitJson(event, "/api/inbox/manual", (form) => ({
   provider: form.get("provider"),
   mailboxConnectionId: null,
   caseId: toNullable(form.get("caseId")),
   subject: form.get("subject"),
   sender: form.get("sender"),
-  recipients: [state.user?.email || "admin@legalpilot.ec"],
+  recipients: state.user?.email ? [state.user.email] : [],
   bodyText: form.get("bodyText"),
   rawReference: "panel-web"
 }), async () => {
@@ -682,32 +798,6 @@ $("#mailboxForm").addEventListener("submit", (event) => submitJson(event, "/api/
 }), async () => {
   await Promise.all([loadIntegrations(), loadOverview()]);
 }));
-
-$("#oauthStartBtn").addEventListener("click", async () => {
-  const form = new FormData($("#mailboxForm"));
-  const button = $("#oauthStartBtn");
-  setLoading(button, true);
-  try {
-    const provider = form.get("provider") === "Gmail" ? "gmail" : "microsoft";
-    const email = encodeURIComponent(form.get("email"));
-    const result = await api(`/api/auth/${provider}/login?email=${email}&mode=json`, { method: "GET" });
-
-    $("#oauthBox").innerHTML = `
-      <strong>OAuth listo para ${escapeHtml(result.provider)}</strong>
-      <span>Estado expira: ${formatDateTime(result.expiresAt)}</span>
-      <span>El callback creara automaticamente el webhook del proveedor.</span>
-      <a href="${escapeHtml(result.authorizationUrl)}" target="_blank" rel="noreferrer">Abrir autorizacion del proveedor</a>
-    `;
-    $("#oauthBox").className = "oauth-box";
-    showToast("OAuth preparado.");
-  } catch (error) {
-    $("#oauthBox").textContent = error.message;
-    $("#oauthBox").className = "oauth-box error";
-    showToast(error.message, "error");
-  } finally {
-    setLoading(button, false);
-  }
-});
 
 $("#caseForm").addEventListener("submit", (event) => submitJson(event, "/api/cases", (form) => ({
   title: form.get("title"),
@@ -836,13 +926,22 @@ $("#holidayForm").addEventListener("submit", (event) => submitJson(event, "/api/
 }));
 
 document.addEventListener("click", async (event) => {
+  const oauthProvider = event.target.closest("[data-oauth-provider]");
   const review = event.target.closest("[data-review-deadline]");
   const ack = event.target.closest("[data-ack-alert]");
   const confirm = event.target.closest("[data-confirm-event]");
   const syncEvent = event.target.closest("[data-sync-event]");
   const sync = event.target.closest("[data-sync-mailbox]");
+  const saveCalendar = event.target.closest("[data-save-calendar]");
+  const disconnectMailbox = event.target.closest("[data-disconnect-mailbox]");
+  const cancelEvent = event.target.closest("[data-cancel-event]");
 
   try {
+    if (oauthProvider) {
+      await startOAuth(oauthProvider.dataset.oauthProvider, oauthProvider);
+      return;
+    }
+
     if (review) {
       await api(`/api/deadlines/${review.dataset.reviewDeadline}/review`, {
         method: "PATCH",
@@ -874,6 +973,28 @@ document.addEventListener("click", async (event) => {
       await api(`/api/mailboxes/${sync.dataset.syncMailbox}/sync`, { method: "POST" });
       await Promise.all([loadIntegrations(), loadOverview()]);
       showToast("Sincronizacion registrada.");
+    }
+
+    if (saveCalendar) {
+      const input = $(`[data-calendar-id="${saveCalendar.dataset.saveCalendar}"]`);
+      await api(`/api/mailboxes/${saveCalendar.dataset.saveCalendar}/calendar`, {
+        method: "PATCH",
+        body: JSON.stringify({ calendarId: input?.value || null })
+      });
+      await loadIntegrations();
+      showToast("Calendario predeterminado guardado.");
+    }
+
+    if (disconnectMailbox) {
+      await api(`/api/mailboxes/${disconnectMailbox.dataset.disconnectMailbox}`, { method: "DELETE" });
+      await Promise.all([loadIntegrations(), loadOverview()]);
+      showToast("Buzon desconectado.");
+    }
+
+    if (cancelEvent) {
+      await api(`/api/calendar/events/${cancelEvent.dataset.cancelEvent}`, { method: "DELETE" });
+      await Promise.all([loadCalendar(), loadIntegrations(), loadOverview()]);
+      showToast("Evento cancelado y sincronizacion externa intentada.");
     }
   } catch (error) {
     showToast(error.message, "error");
