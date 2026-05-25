@@ -195,12 +195,19 @@ nav {
   min-height: 38px;
   padding: 0.58rem 0.72rem;
   color: #cad5dc;
+  text-decoration: none;
 }
 
 .nav.active {
   background: rgba(255, 255, 255, 0.1);
   border-color: rgba(255, 255, 255, 0.26);
   color: #ffffff;
+}
+
+.superadmin-link {
+  border-color: rgba(247, 181, 0, 0.55);
+  color: #fff3c4;
+  background: rgba(247, 181, 0, 0.1);
 }
 
 .ghost {
@@ -598,6 +605,13 @@ nav {
   color: var(--ok);
 }
 
+.tag.master-tag {
+  border-color: #9a6a00;
+  color: #7a5200;
+  background: #fff8db;
+  font-weight: 800;
+}
+
 .danger-action {
   border-color: rgba(180, 35, 24, 0.38);
   color: var(--danger);
@@ -610,6 +624,38 @@ nav {
 .tenant-table {
   display: grid;
   gap: 0.75rem;
+}
+
+.tenant-group {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.tenant-group + .tenant-group {
+  margin-top: 1rem;
+}
+
+.tenant-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.tenant-group-head h3 {
+  margin: 0.12rem 0 0;
+  font-size: 1rem;
+}
+
+.system-tenant-group {
+  border: 1px solid rgba(154, 106, 0, 0.24);
+  background: #fffdf2;
+  border-radius: var(--radius);
+  padding: 0.85rem;
+}
+
+.system-tenant-row td {
+  background: #fffdf2;
 }
 
 .table-scroll {

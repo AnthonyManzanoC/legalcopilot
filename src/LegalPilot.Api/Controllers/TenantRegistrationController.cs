@@ -21,6 +21,16 @@ public sealed class TenantRegistrationController(
         var studioWhatsApp = InputGuard.EcuadorWhatsApp(request.StudioWhatsApp, "WhatsApp del estudio");
         var now = DateTimeOffset.UtcNow;
 
+        if (SuperAdminAccess.IsMasterOwnerEmail(email))
+        {
+            throw new ForbiddenOperationException("El correo maestro debe iniciar sesion; no puede registrarse por onboarding de clientes.");
+        }
+
+        if (IsReservedSystemStudioName(studioName))
+        {
+            throw new ForbiddenOperationException("El tenant userlegal es la base del sistema y no puede registrarse como estudio cliente.");
+        }
+
         var created = store.Write(() =>
         {
             if (store.Users.Any(u => u.Email.Equals(email, StringComparison.OrdinalIgnoreCase) && u.IsActive))
@@ -129,6 +139,14 @@ public sealed class TenantRegistrationController(
         }
 
         return password;
+    }
+
+    private static bool IsReservedSystemStudioName(string value)
+    {
+        var normalized = value.Trim().Replace(" ", "", StringComparison.OrdinalIgnoreCase);
+        return normalized.Equals("userlegal", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Equals("legalpilot", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Equals("legalpilotecuador", StringComparison.OrdinalIgnoreCase);
     }
 
     private sealed record RegisteredStudio(Tenant Tenant, UserAccount User, string RefreshToken, DateTimeOffset RefreshExpiresAt);

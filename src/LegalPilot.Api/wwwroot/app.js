@@ -10,6 +10,8 @@ const state = {
   runtime: null
 };
 
+const MASTER_OWNER_EMAIL = "manzanocoroneljulioanthony@gmail.com";
+
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
 
@@ -44,7 +46,13 @@ const tagClass = (value) => {
   return "";
 };
 
-const isSuperAdmin = () => (state.user?.roles || state.user?.Roles || []).some((role) => String(role).toLowerCase() === "superadmin");
+const isMasterOwnerEmail = (email) => String(email ?? "").trim().toLowerCase() === MASTER_OWNER_EMAIL;
+
+const isSuperAdmin = () => {
+  const roles = state.user?.roles || state.user?.Roles || [];
+  const email = state.user?.email || state.user?.Email;
+  return isMasterOwnerEmail(email) && roles.some((role) => String(role).toLowerCase() === "superadmin");
+};
 
 const setAuthView = (view) => {
   $$("[data-auth-view]").forEach((button) => {
@@ -487,13 +495,74 @@ const loadSuperAdmin = async () => {
   if (!isSuperAdmin()) return;
   const tenants = await api("/api/superadmin/tenants");
   state.superadminTenants = tenants;
-  const active = tenants.filter((tenant) => tenant.isActive).length;
-  const cases = tenants.reduce((sum, tenant) => sum + (tenant.counts?.cases || 0), 0);
-  const clients = tenants.reduce((sum, tenant) => sum + (tenant.counts?.clients || 0), 0);
-  const connected = tenants.filter((tenant) => tenant.integrations?.google?.connected || tenant.integrations?.microsoft?.connected).length;
+  const isSystemTenant = (tenant) => tenant.isSystemTenant || String(tenant.name || "").toLowerCase() === "userlegal";
+  const systemTenants = tenants.filter(isSystemTenant);
+  const clientTenants = tenants.filter((tenant) => !isSystemTenant(tenant));
+  const active = clientTenants.filter((tenant) => tenant.isActive).length;
+  const cases = clientTenants.reduce((sum, tenant) => sum + (tenant.counts?.cases || 0), 0);
+  const clients = clientTenants.reduce((sum, tenant) => sum + (tenant.counts?.clients || 0), 0);
+  const connected = clientTenants.filter((tenant) => tenant.integrations?.google?.connected || tenant.integrations?.microsoft?.connected).length;
+
+  const renderRows = (items) => items.map((tenant) => {
+    const admin = tenant.admins?.[0];
+    const status = tenant.isActive ? "Activo" : "Bloqueado";
+    const system = isSystemTenant(tenant);
+    return `
+      <tr class="${system ? "system-tenant-row" : ""}">
+        <td>
+          <strong>${escapeHtml(tenant.name)}</strong>
+          <span>${escapeHtml(admin?.email || "sin admin activo")}</span>
+          ${system ? `<span class="tag master-tag">${escapeHtml(tenant.systemLabel || "MASTER / SISTEMA BASE")}</span>` : ""}
+        </td>
+        <td>${escapeHtml(tenant.whatsAppNumber || "-")}</td>
+        <td>${tenant.counts?.cases || 0}</td>
+        <td><span class="tag ${tagClass(tenant.integrations?.google?.status)}">${escapeHtml(tenant.integrations?.google?.status || "NotConnected")}</span></td>
+        <td><span class="tag ${tagClass(tenant.integrations?.microsoft?.status)}">${escapeHtml(tenant.integrations?.microsoft?.status || "NotConnected")}</span></td>
+        <td><span class="tag ${system ? "master-tag" : tenant.isActive ? "ok" : "high"}">${escapeHtml(system ? "Sistema base" : status)}</span></td>
+        <td>
+          ${system
+            ? `<span class="tag master-tag">Protegido</span>`
+            : `<button class="compact ${tenant.isActive ? "ghost inline danger-action" : ""}" data-toggle-tenant="${tenant.id}" data-active="${tenant.isActive ? "false" : "true"}">
+                ${tenant.isActive ? "Bloquear" : "Activar"}
+              </button>`}
+        </td>
+      </tr>
+    `;
+  }).join("");
+
+  const renderGroup = (title, subtitle, items, system = false) => `
+    <section class="tenant-group ${system ? "system-tenant-group" : ""}">
+      <div class="tenant-group-head">
+        <div>
+          <p class="eyebrow">${escapeHtml(subtitle)}</p>
+          <h3>${escapeHtml(title)}</h3>
+        </div>
+        <span class="tag ${system ? "master-tag" : ""}">${items.length}</span>
+      </div>
+      ${items.length ? `
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Estudio</th>
+                <th>WhatsApp</th>
+                <th>Casos</th>
+                <th>Google</th>
+                <th>Microsoft</th>
+                <th>Estado</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>${renderRows(items)}</tbody>
+          </table>
+        </div>
+      ` : `<p class="muted">No hay registros en esta seccion.</p>`}
+    </section>
+  `;
 
   $("#superadminMetrics").innerHTML = [
-    ["Tenants", tenants.length],
+    ["Sistema base", systemTenants.length],
+    ["Estudios", clientTenants.length],
     ["Activos", active],
     ["Casos", cases],
     ["Clientes", clients],
@@ -505,47 +574,10 @@ const loadSuperAdmin = async () => {
     </article>
   `).join("");
 
-  $("#superadminTenants").innerHTML = tenants.length ? `
-    <div class="table-scroll">
-      <table>
-        <thead>
-          <tr>
-            <th>Estudio</th>
-            <th>WhatsApp</th>
-            <th>Casos</th>
-            <th>Google</th>
-            <th>Microsoft</th>
-            <th>Estado</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          ${tenants.map((tenant) => {
-            const admin = tenant.admins?.[0];
-            const status = tenant.isActive ? "Activo" : "Bloqueado";
-            return `
-              <tr>
-                <td>
-                  <strong>${escapeHtml(tenant.name)}</strong>
-                  <span>${escapeHtml(admin?.email || "sin admin activo")}</span>
-                </td>
-                <td>${escapeHtml(tenant.whatsAppNumber || "-")}</td>
-                <td>${tenant.counts?.cases || 0}</td>
-                <td><span class="tag ${tagClass(tenant.integrations?.google?.status)}">${escapeHtml(tenant.integrations?.google?.status || "NotConnected")}</span></td>
-                <td><span class="tag ${tagClass(tenant.integrations?.microsoft?.status)}">${escapeHtml(tenant.integrations?.microsoft?.status || "NotConnected")}</span></td>
-                <td><span class="tag ${tenant.isActive ? "ok" : "high"}">${escapeHtml(status)}</span></td>
-                <td>
-                  <button class="compact ${tenant.isActive ? "ghost inline danger-action" : ""}" data-toggle-tenant="${tenant.id}" data-active="${tenant.isActive ? "false" : "true"}">
-                    ${tenant.isActive ? "Bloquear" : "Activar"}
-                  </button>
-                </td>
-              </tr>
-            `;
-          }).join("")}
-        </tbody>
-      </table>
-    </div>
-  ` : `<p class="muted">No hay tenants registrados.</p>`;
+  $("#superadminTenants").innerHTML = tenants.length
+    ? renderGroup("MASTER / SISTEMA BASE", "Tenant reservado", systemTenants, true) +
+      renderGroup("Estudios juridicos clientes", "Tenants comerciales", clientTenants)
+    : `<p class="muted">No hay tenants registrados.</p>`;
 };
 
 const loadSystemStatus = async () => {
@@ -889,7 +921,7 @@ $("#logoutBtn").addEventListener("click", async () => {
   await showApp();
 });
 
-$$(".nav").forEach((button) => {
+$$(".nav[data-view]").forEach((button) => {
   button.addEventListener("click", () => switchView(button.dataset.view));
 });
 

@@ -1,24 +1,28 @@
 using LegalPilot.Api.Application;
 using LegalPilot.Api.Domain;
 using LegalPilot.Api.Infrastructure;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
 namespace LegalPilot.Api.Controllers;
 
 [ApiController]
 [Route("api/superadmin")]
+[Authorize]
 public sealed class SuperAdminController(
     LegalPilotStore store,
-    TokenService tokens,
-    IConfiguration configuration) : ControllerBase
+    TokenService tokens) : ControllerBase
 {
+    private static readonly Guid BootstrapTenantId = Guid.Parse("a3eb2579-63c9-4e34-9f13-d9f5f67ad001");
+
     [HttpGet("tenants")]
     public IActionResult ListTenants()
     {
         var principal = RequireReservedSuperAdmin();
         store.Audit(principal.TenantId, principal.UserId, AuditAction.View, nameof(Tenant), "all", "Panel SuperAdmin consultado.");
         return Ok(store.Read(() => store.Tenants
-            .OrderByDescending(t => t.CreatedAt)
+            .OrderByDescending(t => IsSystemTenant(t, store.Users.Where(u => u.TenantId == t.Id)))
+            .ThenByDescending(t => t.CreatedAt)
             .Select(t => BuildTenantRow(t))
             .ToArray()));
     }
@@ -36,6 +40,11 @@ public sealed class SuperAdminController(
             }
 
             var current = store.Tenants[index];
+            if (IsSystemTenant(current, store.Users.Where(u => u.TenantId == tenantId)))
+            {
+                throw new ForbiddenOperationException("El tenant base del sistema no puede tratarse como suscripcion cliente.");
+            }
+
             var next = current with { IsActive = request.IsActive };
             store.Tenants[index] = next;
 
@@ -72,6 +81,7 @@ public sealed class SuperAdminController(
     private object BuildTenantRow(Tenant tenant)
     {
         var users = store.Users.Where(u => u.TenantId == tenant.Id).ToArray();
+        var isSystemTenant = IsSystemTenant(tenant, users);
         var mailboxes = store.Mailboxes.Where(m => m.TenantId == tenant.Id && m.Status != "Disconnected").ToArray();
         var google = ResolveProviderStatus(mailboxes, MailProvider.Gmail);
         var microsoft = ResolveProviderStatus(mailboxes, MailProvider.Outlook);
@@ -87,6 +97,9 @@ public sealed class SuperAdminController(
             tenant.WhatsAppNumber,
             tenant.CreatedAt,
             tenant.IsActive,
+            isSystemTenant,
+            tenantScope = isSystemTenant ? "SystemBase" : "ClientTenant",
+            systemLabel = isSystemTenant ? "MASTER / SISTEMA BASE" : null,
             subscriptionStatus = tenant.IsActive ? "Active" : "Blocked",
             admins = users
                 .Where(u => u.IsActive && (u.Roles.Contains(UserRole.Admin) || u.Roles.Contains(UserRole.Lawyer)))
@@ -148,13 +161,7 @@ public sealed class SuperAdminController(
     {
         var principal = HttpAuth.RequirePrincipal(Request, tokens);
         HttpAuth.RequireRole(principal, UserRole.SuperAdmin);
-        var allowedEmail = FirstConfigured(
-            Environment.GetEnvironmentVariable("LEGALPILOT_SUPERADMIN_EMAIL"),
-            configuration["LegalPilot:SuperAdmin:Email"],
-            Environment.GetEnvironmentVariable("LEGALPILOT_BOOTSTRAP_ADMIN_EMAIL"),
-            configuration["LegalPilot:Bootstrap:AdminEmail"]);
-        if (!string.IsNullOrWhiteSpace(allowedEmail) &&
-            !principal.Email.Equals(allowedEmail, StringComparison.OrdinalIgnoreCase))
+        if (!SuperAdminAccess.IsMasterOwnerEmail(principal.Email))
         {
             throw new ForbiddenOperationException("SuperAdmin reservado para el correo maestro configurado.");
         }
@@ -162,9 +169,11 @@ public sealed class SuperAdminController(
         return principal;
     }
 
-    private static string? FirstConfigured(params string?[] values)
+    private static bool IsSystemTenant(Tenant tenant, IEnumerable<UserAccount> users)
     {
-        return values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
+        return tenant.Id == BootstrapTenantId ||
+               tenant.Name.Equals("userlegal", StringComparison.OrdinalIgnoreCase) ||
+               users.Any(user => SuperAdminAccess.IsMasterOwnerEmail(user.Email));
     }
 }
 

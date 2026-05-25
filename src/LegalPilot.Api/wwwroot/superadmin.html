@@ -5,6 +5,29 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>LegalPilot Super Admin</title>
   <link rel="stylesheet" href="/styles.css">
+  <script>
+    (() => {
+      const masterEmail = "manzanocoroneljulioanthony@gmail.com";
+      const token = localStorage.getItem("legalpilot.token");
+      const payload = (() => {
+        if (!token) return null;
+        const parts = token.split(".");
+        if (parts.length !== 3) return null;
+        try {
+          const normalized = parts[1].replaceAll("-", "+").replaceAll("_", "/");
+          const padded = normalized.padEnd(normalized.length + (4 - normalized.length % 4) % 4, "=");
+          const data = JSON.parse(atob(padded));
+          return Number(data.exp || 0) * 1000 > Date.now() ? data : null;
+        } catch {
+          return null;
+        }
+      })();
+      const roles = Array.isArray(payload?.roles) ? payload.roles : [];
+      const allowed = String(payload?.email || "").trim().toLowerCase() === masterEmail &&
+        roles.some((role) => String(role).toLowerCase() === "superadmin");
+      if (!allowed) window.location.href = "/";
+    })();
+  </script>
 </head>
 <body class="authenticated">
   <main class="workspace superadmin-page">
@@ -34,116 +57,174 @@
 
   <div id="toast" class="toast hidden"></div>
   <script>
-    const token = localStorage.getItem("legalpilot.token");
-    const $ = (selector, root = document) => root.querySelector(selector);
-    const escapeHtml = (value) => String(value ?? "")
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll("\"", "&quot;");
-    const tagClass = (value) => {
-      const raw = String(value ?? "").toLowerCase();
-      if (raw.includes("blocked") || raw.includes("failed") || raw.includes("missing")) return "high";
-      if (raw.includes("active") || raw.includes("connected")) return "ok";
-      return "";
-    };
-    const showToast = (message, kind = "ok") => {
-      const toast = $("#toast");
-      toast.textContent = message;
-      toast.className = `toast ${kind}`;
-      clearTimeout(showToast.timer);
-      showToast.timer = setTimeout(() => toast.classList.add("hidden"), 3200);
-    };
-    const api = async (path, options = {}) => {
-      const response = await fetch(path, {
-        ...options,
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-          ...(options.headers || {})
+    (() => {
+      const MASTER_OWNER_EMAIL = "manzanocoroneljulioanthony@gmail.com";
+      const redirectToLogin = () => { window.location.href = "/"; };
+      const readJwtPayload = (rawToken) => {
+        if (!rawToken) return null;
+        const parts = rawToken.split(".");
+        if (parts.length !== 3) return null;
+        try {
+          const normalized = parts[1].replaceAll("-", "+").replaceAll("_", "/");
+          const padded = normalized.padEnd(normalized.length + (4 - normalized.length % 4) % 4, "=");
+          const payload = JSON.parse(atob(padded));
+          if (Number(payload.exp || 0) * 1000 <= Date.now()) return null;
+          return payload;
+        } catch {
+          return null;
         }
-      });
-      const data = response.headers.get("content-type")?.includes("application/json")
-        ? await response.json()
-        : await response.text();
-      if (!response.ok) throw new Error(data?.error || data || "Solicitud fallida");
-      return data;
-    };
-    const render = (items) => {
-      const active = items.filter((tenant) => tenant.isActive).length;
-      const cases = items.reduce((sum, tenant) => sum + (tenant.counts?.cases || 0), 0);
-      const clients = items.reduce((sum, tenant) => sum + (tenant.counts?.clients || 0), 0);
-      $("#metrics").innerHTML = [
-        ["Tenants", items.length],
-        ["Activos", active],
-        ["Bloqueados", items.length - active],
-        ["Casos", cases],
-        ["Clientes", clients]
-      ].map(([label, value]) => `<article class="metric"><strong>${value}</strong><span>${escapeHtml(label)}</span></article>`).join("");
-      $("#tenants").innerHTML = items.length ? `
-        <div class="table-scroll">
-          <table>
-            <thead>
-              <tr>
-                <th>Estudio</th>
-                <th>WhatsApp</th>
-                <th>Casos</th>
-                <th>Google</th>
-                <th>Microsoft</th>
-                <th>Estado</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              ${items.map((tenant) => `
-                <tr>
-                  <td><strong>${escapeHtml(tenant.name)}</strong><span>${escapeHtml(tenant.admins?.[0]?.email || "sin admin")}</span></td>
-                  <td>${escapeHtml(tenant.whatsAppNumber || "-")}</td>
-                  <td>${tenant.counts?.cases || 0}</td>
-                  <td><span class="tag ${tagClass(tenant.integrations?.google?.status)}">${escapeHtml(tenant.integrations?.google?.status || "NotConnected")}</span></td>
-                  <td><span class="tag ${tagClass(tenant.integrations?.microsoft?.status)}">${escapeHtml(tenant.integrations?.microsoft?.status || "NotConnected")}</span></td>
-                  <td><span class="tag ${tenant.isActive ? "ok" : "high"}">${tenant.isActive ? "Activo" : "Bloqueado"}</span></td>
-                  <td><button class="compact ${tenant.isActive ? "ghost inline danger-action" : ""}" data-toggle-tenant="${tenant.id}" data-active="${tenant.isActive ? "false" : "true"}">${tenant.isActive ? "Bloquear" : "Activar"}</button></td>
-                </tr>
-              `).join("")}
-            </tbody>
-          </table>
-        </div>
-      ` : `<p class="muted">No hay tenants registrados.</p>`;
-    };
-    const load = async () => {
-      if (!token) {
-        $("#superadminStatus").textContent = "Sin sesion";
-        $("#tenants").innerHTML = `<p class="muted">Inicie sesion como SuperAdmin desde el panel principal.</p>`;
+      };
+      const isAuthorizedSuperAdmin = (payload) => {
+        const roles = Array.isArray(payload?.roles) ? payload.roles : [];
+        const email = String(payload?.email || "").trim().toLowerCase();
+        return email === MASTER_OWNER_EMAIL && roles.some((role) => String(role).toLowerCase() === "superadmin");
+      };
+      const token = localStorage.getItem("legalpilot.token");
+      const tokenPayload = readJwtPayload(token);
+      if (!isAuthorizedSuperAdmin(tokenPayload)) {
+        redirectToLogin();
         return;
       }
-      try {
-        const items = await api("/api/superadmin/tenants");
-        $("#superadminStatus").textContent = "Conectado";
-        $("#superadminStatus").className = "status-chip ok";
-        render(items);
-      } catch (error) {
-        $("#superadminStatus").textContent = "Sin acceso";
-        $("#superadminStatus").className = "status-chip";
-        $("#tenants").innerHTML = `<p class="error">${escapeHtml(error.message)}</p>`;
-      }
-    };
-    $("#refreshBtn").addEventListener("click", load);
-    document.addEventListener("click", async (event) => {
-      const button = event.target.closest("[data-toggle-tenant]");
-      if (!button) return;
-      try {
-        await api(`/api/superadmin/tenants/${button.dataset.toggleTenant}/subscription`, {
-          method: "PATCH",
-          body: JSON.stringify({ isActive: button.dataset.active === "true" })
+
+      const $ = (selector, root = document) => root.querySelector(selector);
+      const escapeHtml = (value) => String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll("\"", "&quot;");
+      const tagClass = (value) => {
+        const raw = String(value ?? "").toLowerCase();
+        if (raw.includes("blocked") || raw.includes("failed") || raw.includes("missing")) return "high";
+        if (raw.includes("active") || raw.includes("connected")) return "ok";
+        return "";
+      };
+      const isSystemTenant = (tenant) => tenant.isSystemTenant || String(tenant.name || "").toLowerCase() === "userlegal";
+      const showToast = (message, kind = "ok") => {
+        const toast = $("#toast");
+        toast.textContent = message;
+        toast.className = `toast ${kind}`;
+        clearTimeout(showToast.timer);
+        showToast.timer = setTimeout(() => toast.classList.add("hidden"), 3200);
+      };
+      const api = async (path, options = {}) => {
+        const response = await fetch(path, {
+          ...options,
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+            ...(options.headers || {})
+          }
         });
-        await load();
-        showToast("Suscripcion actualizada.");
-      } catch (error) {
-        showToast(error.message, "error");
-      }
-    });
-    load();
+        const data = response.headers.get("content-type")?.includes("application/json")
+          ? await response.json()
+          : await response.text();
+        if (response.status === 401 || response.status === 403) {
+          redirectToLogin();
+          throw new Error("Sin acceso de SuperAdmin.");
+        }
+        if (!response.ok) throw new Error(data?.error || data || "Solicitud fallida");
+        return data;
+      };
+      const renderRows = (items) => items.map((tenant) => {
+        const system = isSystemTenant(tenant);
+        const status = tenant.isActive ? "Activo" : "Bloqueado";
+        return `
+          <tr class="${system ? "system-tenant-row" : ""}">
+            <td>
+              <strong>${escapeHtml(tenant.name)}</strong>
+              <span>${escapeHtml(tenant.admins?.[0]?.email || "sin admin")}</span>
+              ${system ? `<span class="tag master-tag">${escapeHtml(tenant.systemLabel || "MASTER / SISTEMA BASE")}</span>` : ""}
+            </td>
+            <td>${escapeHtml(tenant.whatsAppNumber || "-")}</td>
+            <td>${tenant.counts?.cases || 0}</td>
+            <td><span class="tag ${tagClass(tenant.integrations?.google?.status)}">${escapeHtml(tenant.integrations?.google?.status || "NotConnected")}</span></td>
+            <td><span class="tag ${tagClass(tenant.integrations?.microsoft?.status)}">${escapeHtml(tenant.integrations?.microsoft?.status || "NotConnected")}</span></td>
+            <td><span class="tag ${system ? "master-tag" : tenant.isActive ? "ok" : "high"}">${escapeHtml(system ? "Sistema base" : status)}</span></td>
+            <td>
+              ${system
+                ? `<span class="tag master-tag">Protegido</span>`
+                : `<button class="compact ${tenant.isActive ? "ghost inline danger-action" : ""}" data-toggle-tenant="${tenant.id}" data-active="${tenant.isActive ? "false" : "true"}">${tenant.isActive ? "Bloquear" : "Activar"}</button>`}
+            </td>
+          </tr>
+        `;
+      }).join("");
+      const renderGroup = (title, subtitle, items, system = false) => `
+        <section class="tenant-group ${system ? "system-tenant-group" : ""}">
+          <div class="tenant-group-head">
+            <div>
+              <p class="eyebrow">${escapeHtml(subtitle)}</p>
+              <h3>${escapeHtml(title)}</h3>
+            </div>
+            <span class="tag ${system ? "master-tag" : ""}">${items.length}</span>
+          </div>
+          ${items.length ? `
+            <div class="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Estudio</th>
+                    <th>WhatsApp</th>
+                    <th>Casos</th>
+                    <th>Google</th>
+                    <th>Microsoft</th>
+                    <th>Estado</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>${renderRows(items)}</tbody>
+              </table>
+            </div>
+          ` : `<p class="muted">No hay registros en esta seccion.</p>`}
+        </section>
+      `;
+      const render = (items) => {
+        const systemTenants = items.filter(isSystemTenant);
+        const clientTenants = items.filter((tenant) => !isSystemTenant(tenant));
+        const active = clientTenants.filter((tenant) => tenant.isActive).length;
+        const cases = clientTenants.reduce((sum, tenant) => sum + (tenant.counts?.cases || 0), 0);
+        const clients = clientTenants.reduce((sum, tenant) => sum + (tenant.counts?.clients || 0), 0);
+        $("#metrics").innerHTML = [
+          ["Sistema base", systemTenants.length],
+          ["Estudios", clientTenants.length],
+          ["Activos", active],
+          ["Bloqueados", clientTenants.length - active],
+          ["Casos", cases],
+          ["Clientes", clients]
+        ].map(([label, value]) => `<article class="metric"><strong>${value}</strong><span>${escapeHtml(label)}</span></article>`).join("");
+        $("#tenants").innerHTML = items.length
+          ? renderGroup("MASTER / SISTEMA BASE", "Tenant reservado", systemTenants, true) +
+            renderGroup("Estudios juridicos clientes", "Tenants comerciales", clientTenants)
+          : `<p class="muted">No hay tenants registrados.</p>`;
+      };
+      const load = async () => {
+        try {
+          const items = await api("/api/superadmin/tenants");
+          $("#superadminStatus").textContent = "Conectado";
+          $("#superadminStatus").className = "status-chip ok";
+          render(items);
+        } catch (error) {
+          $("#superadminStatus").textContent = "Sin acceso";
+          $("#superadminStatus").className = "status-chip";
+          $("#tenants").innerHTML = `<p class="error">${escapeHtml(error.message)}</p>`;
+        }
+      };
+      $("#refreshBtn").addEventListener("click", load);
+      document.addEventListener("click", async (event) => {
+        const button = event.target.closest("[data-toggle-tenant]");
+        if (!button) return;
+        try {
+          await api(`/api/superadmin/tenants/${button.dataset.toggleTenant}/subscription`, {
+            method: "PATCH",
+            body: JSON.stringify({ isActive: button.dataset.active === "true" })
+          });
+          await load();
+          showToast("Suscripcion actualizada.");
+        } catch (error) {
+          showToast(error.message, "error");
+        }
+      });
+      load();
+    })();
   </script>
 </body>
 </html>

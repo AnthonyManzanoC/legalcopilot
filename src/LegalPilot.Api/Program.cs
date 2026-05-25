@@ -5,6 +5,7 @@ using System.Net;
 using LegalPilot.Api.Application;
 using LegalPilot.Api.Domain;
 using LegalPilot.Api.Infrastructure;
+using Microsoft.AspNetCore.Authentication;
 
 var builder = WebApplication.CreateBuilder(args);
 DotEnv.Load(builder.Environment.ContentRootPath, Directory.GetCurrentDirectory());
@@ -53,6 +54,11 @@ builder.Services.AddHostedService<ReminderDispatcher>();
 builder.Services.AddHostedService<MailboxSyncWorker>();
 builder.Services.AddHostedService<DeadlineMonitorWorker>();
 builder.Services.AddHostedService<CalendarExternalSyncWorker>();
+builder.Services.AddAuthentication(LegalPilotAuthenticationDefaults.Scheme)
+    .AddScheme<AuthenticationSchemeOptions, LegalPilotAuthenticationHandler>(
+        LegalPilotAuthenticationDefaults.Scheme,
+        _ => { });
+builder.Services.AddAuthorization();
 builder.Services.AddControllers()
     .AddJsonOptions(options =>
     {
@@ -122,6 +128,9 @@ app.Use(async (context, next) =>
         await context.Response.WriteAsJsonAsync(new { error = "Error interno controlado. Revise logs del servidor.", traceId = context.TraceIdentifier });
     }
 });
+
+app.UseAuthentication();
+app.UseAuthorization();
 
 app.MapGet("/health", (LegalPilotStore store) => Results.Ok(new
 {

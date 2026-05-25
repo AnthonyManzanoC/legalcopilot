@@ -1,7 +1,11 @@
 using System.Security.Cryptography;
+using System.Security.Claims;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using LegalPilot.Api.Domain;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.Extensions.Options;
 
 namespace LegalPilot.Api.Application;
 
@@ -286,4 +290,50 @@ public static class HttpAuth
             throw new ForbiddenOperationException("No tiene permisos para esta accion.");
         }
     }
+}
+
+public static class LegalPilotAuthenticationDefaults
+{
+    public const string Scheme = "LegalPilotBearer";
+}
+
+public sealed class LegalPilotAuthenticationHandler(
+    IOptionsMonitor<AuthenticationSchemeOptions> options,
+    ILoggerFactory logger,
+    UrlEncoder encoder,
+    TokenService tokens) : AuthenticationHandler<AuthenticationSchemeOptions>(options, logger, encoder)
+{
+    protected override Task<AuthenticateResult> HandleAuthenticateAsync()
+    {
+        var header = Request.Headers.Authorization.ToString();
+        var rawToken = header.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
+            ? header["Bearer ".Length..]
+            : null;
+        var principal = tokens.Validate(rawToken);
+        if (principal is null)
+        {
+            return Task.FromResult(AuthenticateResult.NoResult());
+        }
+
+        var claims = new List<Claim>
+        {
+            new(ClaimTypes.NameIdentifier, principal.UserId.ToString()),
+            new(ClaimTypes.Email, principal.Email),
+            new("tenant", principal.TenantId.ToString())
+        };
+        claims.AddRange(principal.Roles.Select(role => new Claim(ClaimTypes.Role, role.ToString())));
+
+        var identity = new ClaimsIdentity(claims, LegalPilotAuthenticationDefaults.Scheme);
+        var ticket = new AuthenticationTicket(new ClaimsPrincipal(identity), LegalPilotAuthenticationDefaults.Scheme);
+        return Task.FromResult(AuthenticateResult.Success(ticket));
+    }
+}
+
+public static class SuperAdminAccess
+{
+    public const string MasterOwnerEmail = "manzanocoroneljulioanthony@gmail.com";
+
+    public static bool IsMasterOwnerEmail(string? email) =>
+        !string.IsNullOrWhiteSpace(email) &&
+        email.Trim().Equals(MasterOwnerEmail, StringComparison.OrdinalIgnoreCase);
 }

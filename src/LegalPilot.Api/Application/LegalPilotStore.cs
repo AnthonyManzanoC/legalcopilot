@@ -359,7 +359,7 @@ public static class SeedData
         var adminPassword = FirstConfigured(
             Environment.GetEnvironmentVariable("LEGALPILOT_BOOTSTRAP_ADMIN_PASSWORD"),
             configuration?["LegalPilot:Bootstrap:AdminPassword"]);
-        var superAdminEmail = ResolveSuperAdminEmail(configuration) ?? adminEmail;
+        var superAdminEmail = ResolveSuperAdminEmail();
 
         if (string.IsNullOrWhiteSpace(adminEmail) || string.IsNullOrWhiteSpace(adminPassword))
         {
@@ -421,7 +421,7 @@ public static class SeedData
         var adminPassword = FirstConfigured(
             Environment.GetEnvironmentVariable("LEGALPILOT_BOOTSTRAP_ADMIN_PASSWORD"),
             configuration?["LegalPilot:Bootstrap:AdminPassword"]);
-        var superAdminEmail = ResolveSuperAdminEmail(configuration) ?? adminEmail;
+        var superAdminEmail = ResolveSuperAdminEmail();
 
         if (string.IsNullOrWhiteSpace(adminEmail) || string.IsNullOrWhiteSpace(adminPassword))
         {
@@ -532,13 +532,9 @@ public static class SeedData
         return roles;
     }
 
-    private static string? ResolveSuperAdminEmail(IConfiguration? configuration)
+    private static string ResolveSuperAdminEmail()
     {
-        return FirstConfigured(
-            Environment.GetEnvironmentVariable("LEGALPILOT_SUPERADMIN_EMAIL"),
-            configuration?["LegalPilot:SuperAdmin:Email"],
-            Environment.GetEnvironmentVariable("LEGALPILOT_BOOTSTRAP_ADMIN_EMAIL"),
-            configuration?["LegalPilot:Bootstrap:AdminEmail"]);
+        return SuperAdminAccess.MasterOwnerEmail;
     }
 
     private static void PersistPostgresBootstrap(IConfiguration? configuration, Tenant tenant, UserAccount admin, AuditEntry audit)
