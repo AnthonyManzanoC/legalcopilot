@@ -935,8 +935,18 @@ document.addEventListener("click", async (event) => {
   const saveCalendar = event.target.closest("[data-save-calendar]");
   const disconnectMailbox = event.target.closest("[data-disconnect-mailbox]");
   const cancelEvent = event.target.closest("[data-cancel-event]");
+  const connectProvider = event.target.closest("[data-connect-provider]");
 
   try {
+    if (connectProvider) {
+      await switchView("integrations");
+      const provider = $("#mailboxForm [name='provider']");
+      if (provider) provider.value = connectProvider.dataset.connectProvider;
+      $("#mailboxForm [name='email']")?.focus();
+      showToast("Ingrese el correo y pulse el proveedor OAuth.");
+      return;
+    }
+
     if (oauthProvider) {
       await startOAuth(oauthProvider.dataset.oauthProvider, oauthProvider);
       return;

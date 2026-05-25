@@ -135,6 +135,7 @@ public sealed class GmailEmailConnector(
     ProcessMessages:
         var ingested = 0;
         var skipped = 0;
+        var failed = 0;
         foreach (var id in messageIds.Distinct(StringComparer.OrdinalIgnoreCase))
         {
             if (string.IsNullOrWhiteSpace(id))
@@ -152,14 +153,26 @@ public sealed class GmailEmailConnector(
                 continue;
             }
 
-            var messageResult = await IngestGmailMessageAsync(access.Token!, mailbox, id, cancellationToken);
-            if (messageResult)
+            try
             {
-                ingested++;
+                var messageResult = await IngestGmailMessageAsync(access.Token!, mailbox, id, cancellationToken);
+                if (messageResult)
+                {
+                    ingested++;
+                }
+                else
+                {
+                    failed++;
+                }
+            }
+            catch (Exception ex)
+            {
+                failed++;
+                logger.LogWarning(ex, "Gmail message {MessageId} failed but sync will continue.", id);
             }
         }
 
-        return new MailboxSyncResult(true, "Synced", $"Gmail sincronizado. Nuevos: {ingested}. Duplicados omitidos: {skipped}.", DateTimeOffset.UtcNow.AddMinutes(15), nextCursor, watch.ExpiresAt, watch.SubscriptionId);
+        return new MailboxSyncResult(true, "Synced", $"Gmail sincronizado. Nuevos: {ingested}. Duplicados omitidos: {skipped}. Errores controlados: {failed}.", DateTimeOffset.UtcNow.AddMinutes(15), nextCursor, watch.ExpiresAt, watch.SubscriptionId);
     }
 
     private async Task<TokenResolution> ResolveAccessTokenAsync(MailboxConnection mailbox, CancellationToken cancellationToken)
@@ -600,6 +613,7 @@ public sealed class MicrosoftGraphEmailConnector(
                 : mailbox.Cursor;
         var ingested = 0;
         var skipped = 0;
+        var failed = 0;
         foreach (var item in messages.EnumerateArray())
         {
             var id = item.TryGetProperty("id", out var idElement) ? idElement.GetString() : null;
@@ -618,12 +632,20 @@ public sealed class MicrosoftGraphEmailConnector(
                 continue;
             }
 
-            var envelope = await GraphMessageToEnvelopeAsync(access.Token!, id, item, cancellationToken);
-            workflow.IngestWebhook(mailbox.TenantId, Provider, envelope with { MailboxConnectionId = mailbox.Id });
-            ingested++;
+            try
+            {
+                var envelope = await GraphMessageToEnvelopeAsync(access.Token!, id, item, cancellationToken);
+                workflow.IngestWebhook(mailbox.TenantId, Provider, envelope with { MailboxConnectionId = mailbox.Id });
+                ingested++;
+            }
+            catch (Exception ex)
+            {
+                failed++;
+                logger.LogWarning(ex, "Graph message {MessageId} failed but sync will continue.", id);
+            }
         }
 
-        return new MailboxSyncResult(true, "Synced", $"Microsoft Graph sincronizado. Nuevos: {ingested}. Duplicados omitidos: {skipped}.", DateTimeOffset.UtcNow.AddMinutes(15), nextCursor, subscription.ExpiresAt, subscription.SubscriptionId);
+        return new MailboxSyncResult(true, "Synced", $"Microsoft Graph sincronizado. Nuevos: {ingested}. Duplicados omitidos: {skipped}. Errores controlados: {failed}.", DateTimeOffset.UtcNow.AddMinutes(15), nextCursor, subscription.ExpiresAt, subscription.SubscriptionId);
     }
 
     private async Task<TokenResolution> ResolveAccessTokenAsync(MailboxConnection mailbox, CancellationToken cancellationToken)

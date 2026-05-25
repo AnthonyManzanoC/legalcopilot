@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Globalization;
 using LegalPilot.Api.Domain;
 using LegalPilot.Api.Infrastructure;
 
@@ -471,7 +472,15 @@ public sealed class MailboxService(LegalPilotStore store, EmailConnectorRegistry
         var mailbox = store.Read(() => store.Mailboxes.FirstOrDefault(m => m.Id == mailboxId && m.TenantId == principal.TenantId))
             ?? throw new KeyNotFoundException("Buzon no encontrado.");
         var connector = connectors.Get(mailbox.Provider);
-        var result = await connector.SyncAsync(mailbox, cancellationToken);
+        MailboxSyncResult result;
+        try
+        {
+            result = await connector.SyncAsync(mailbox, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            result = new MailboxSyncResult(false, "SyncError", $"Sincronizacion registrada con error controlado: {ex.Message}", DateTimeOffset.UtcNow.AddMinutes(15), mailbox.Cursor, mailbox.WatchExpiresAt, mailbox.WebhookSubscriptionId);
+        }
 
         return RecordSyncState(mailbox, result, principal.UserId);
     }
@@ -550,7 +559,7 @@ public sealed class LegalWorkflowService(
         var provider = request.Provider;
         var subject = InputGuard.Required(request.Subject, "Asunto", 240);
         var sender = InputGuard.Email(request.Sender, "Remitente");
-        var bodyText = InputGuard.TextBlock(request.BodyText, "Cuerpo", 12000);
+        var bodyText = PrepareBodyOrThrow(request.BodyText);
         EnsureCaseAndMailbox(principal.TenantId, request.CaseId, request.MailboxConnectionId);
         var externalMessageId = InputGuard.Optional(request.ExternalMessageId, 180);
         var messageHash = BuildMessageHash(provider, externalMessageId, subject, sender, bodyText, request.ReceivedAt);
@@ -572,8 +581,10 @@ public sealed class LegalWorkflowService(
         var emailId = Guid.NewGuid();
         var attachments = BuildAttachments(principal.TenantId, emailId, request.Attachments);
         var analysisBody = AppendAttachmentText(bodyText, attachments);
-        var extraction = intelligence.Extract(subject, analysisBody);
+        var storedBody = HtmlSanitizer.ClipForStorage(analysisBody);
+        var extraction = intelligence.Extract(subject, HtmlSanitizer.ClipForAnalysis(analysisBody));
         var caseId = ResolveCaseId(principal.TenantId, extraction.CaseNumber, request.CaseId);
+        var processedWithFallback = ExtractionUsedFallback(extraction);
         var now = DateTimeOffset.UtcNow;
 
         var email = new LegalEmail(
@@ -586,15 +597,15 @@ public sealed class LegalWorkflowService(
             subject,
             sender,
             request.Recipients ?? [],
-            analysisBody,
+            storedBody,
             InputGuard.Optional(request.RawReference, 200) is { Length: > 0 } rawReference ? rawReference : "manual",
             request.ReceivedAt ?? now,
-            "Processed",
+            processedWithFallback ? "RequiresManualReview" : "Processed",
             extraction,
             now,
             messageHash,
-            extraction.Signals.Any(s => s.Equals("fallback-local-heuristic", StringComparison.OrdinalIgnoreCase)),
-            extraction.Signals.Any(s => s.Equals("fallback-local-heuristic", StringComparison.OrdinalIgnoreCase)) ? "LLM externo no disponible o salida invalida." : null);
+            processedWithFallback,
+            processedWithFallback ? "LLM externo no disponible o salida invalida." : null);
 
         store.Write(() =>
         {
@@ -611,8 +622,23 @@ public sealed class LegalWorkflowService(
 
     public LegalEmail IngestWebhook(Guid tenantId, MailProvider provider, WebhookEmailEnvelope envelope)
     {
+        try
+        {
+            return IngestWebhookCore(tenantId, provider, envelope);
+        }
+        catch (Exception ex)
+        {
+            return RecordFailedWebhookEmail(tenantId, provider, envelope, "Error", ex.Message);
+        }
+    }
+
+    private LegalEmail IngestWebhookCore(Guid tenantId, MailProvider provider, WebhookEmailEnvelope envelope)
+    {
         var externalMessageId = InputGuard.Optional(envelope.ExternalMessageId, 180);
-        var messageHash = BuildMessageHash(provider, externalMessageId, envelope.Subject, envelope.Sender, envelope.BodyText, envelope.ReceivedAt);
+        var subject = SafeSubject(envelope.Subject);
+        var sender = SafeSender(envelope.Sender, provider);
+        var bodyText = PrepareBodyOrThrow(envelope.BodyText);
+        var messageHash = BuildMessageHash(provider, externalMessageId, subject, sender, bodyText, envelope.ReceivedAt);
         if (!string.IsNullOrWhiteSpace(externalMessageId))
         {
             var existing = FindExistingEmail(tenantId, provider, externalMessageId);
@@ -628,14 +654,18 @@ public sealed class LegalWorkflowService(
             return existing;
         }
 
-        var subject = InputGuard.Required(envelope.Subject, "Asunto", 240);
-        var sender = InputGuard.Required(envelope.Sender, "Remitente", 254);
-        var bodyText = InputGuard.TextBlock(envelope.BodyText, "Cuerpo", 12000);
         var emailId = Guid.NewGuid();
         var attachments = BuildAttachments(tenantId, emailId, envelope.Attachments);
         var analysisBody = AppendAttachmentText(bodyText, attachments);
-        var extraction = intelligence.Extract(subject, analysisBody);
+        var storedBody = HtmlSanitizer.ClipForStorage(analysisBody);
+        if (!LooksLikeLegalNotification(subject, sender, analysisBody))
+        {
+            return RecordIgnoredWebhookEmail(tenantId, provider, envelope, externalMessageId, subject, sender, storedBody, messageHash);
+        }
+
+        var extraction = intelligence.Extract(subject, HtmlSanitizer.ClipForAnalysis(analysisBody));
         var caseId = ResolveCaseId(tenantId, extraction.CaseNumber, null);
+        var processedWithFallback = ExtractionUsedFallback(extraction);
         var now = DateTimeOffset.UtcNow;
         var email = new LegalEmail(
             emailId,
@@ -647,15 +677,15 @@ public sealed class LegalWorkflowService(
             subject,
             sender,
             envelope.Recipients ?? [],
-            analysisBody,
+            storedBody,
             InputGuard.Optional(envelope.RawReference, 200) is { Length: > 0 } rawReference ? rawReference : provider.ToString(),
             envelope.ReceivedAt ?? now,
-            "ProcessedFromWebhook",
+            processedWithFallback ? "RequiresManualReview" : "ProcessedFromWebhook",
             extraction,
             now,
             messageHash,
-            extraction.Signals.Any(s => s.Equals("fallback-local-heuristic", StringComparison.OrdinalIgnoreCase)),
-            extraction.Signals.Any(s => s.Equals("fallback-local-heuristic", StringComparison.OrdinalIgnoreCase)) ? "LLM externo no disponible o salida invalida." : null);
+            processedWithFallback,
+            processedWithFallback ? "LLM externo no disponible o salida invalida." : null);
 
         store.Write(() =>
         {
@@ -665,6 +695,141 @@ public sealed class LegalWorkflowService(
         });
         store.Audit(tenantId, null, AuditAction.WebhookReceived, nameof(LegalEmail), email.Id.ToString(), $"Webhook {provider} procesado. Adjuntos: {attachments.Count}.");
         CreateDerivedWork(email, null);
+        return email;
+    }
+
+    private LegalEmail RecordFailedWebhookEmail(Guid tenantId, MailProvider provider, WebhookEmailEnvelope envelope, string status, string reason)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var externalMessageId = SafeExternalMessageId(envelope.ExternalMessageId) ?? $"webhook-error-{Guid.NewGuid():N}";
+        var subject = SafeSubject(envelope.Subject);
+        var sender = SafeSender(envelope.Sender, provider);
+        var bodyText = HtmlSanitizer.ToLegalInnerText(envelope.BodyText);
+        if (string.IsNullOrWhiteSpace(bodyText))
+        {
+            bodyText = subject;
+        }
+
+        var storedBody = HtmlSanitizer.ClipForStorage(bodyText);
+        var messageHash = BuildMessageHash(provider, externalMessageId, subject, sender, storedBody, envelope.ReceivedAt);
+        if (FindExistingEmail(tenantId, provider, externalMessageId) is { } existingById)
+        {
+            return existingById;
+        }
+
+        if (FindExistingEmailByHash(tenantId, provider, messageHash) is { } existingByHash)
+        {
+            return existingByHash;
+        }
+
+        var errorSummary = Truncate($"No se pudo procesar automaticamente este correo. Motivo: {reason}", 360);
+        var extraction = new LegalExtraction(
+            LegalActType.Unknown,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            "Revision manual requerida antes de crear plazos o agenda.",
+            true,
+            "Alta",
+            0.35m,
+            errorSummary,
+            "El estudio revisara esta notificacion manualmente.",
+            "Borrador: revisar el correo original y registrar manualmente la actuacion necesaria.",
+            ["processing-error", "requires-manual-review"],
+            [],
+            []);
+
+        var email = new LegalEmail(
+            Guid.NewGuid(),
+            tenantId,
+            envelope.MailboxConnectionId,
+            null,
+            provider,
+            externalMessageId,
+            subject,
+            sender,
+            envelope.Recipients ?? [],
+            storedBody,
+            SafeRawReference(envelope.RawReference) ?? provider.ToString(),
+            envelope.ReceivedAt ?? now,
+            status,
+            extraction,
+            now,
+            messageHash,
+            true,
+            errorSummary);
+
+        store.Write(() =>
+        {
+            store.Emails.Insert(0, email);
+            store.MailProcessingLogs.Insert(0, new MailProcessingLog(Guid.NewGuid(), tenantId, envelope.MailboxConnectionId, email.Id, provider, "webhook-ingest", status, errorSummary, 1, now, null));
+        });
+        store.Audit(tenantId, null, AuditAction.ProcessMail, nameof(LegalEmail), email.Id.ToString(), errorSummary);
+        NotifyProcessingIssue(email, errorSummary);
+        return email;
+    }
+
+    private LegalEmail RecordIgnoredWebhookEmail(Guid tenantId, MailProvider provider, WebhookEmailEnvelope envelope, string? externalMessageId, string subject, string sender, string bodyText, string messageHash)
+    {
+        externalMessageId = string.IsNullOrWhiteSpace(externalMessageId) ? $"ignored-{Guid.NewGuid():N}" : externalMessageId;
+        if (FindExistingEmail(tenantId, provider, externalMessageId) is { } existingById)
+        {
+            return existingById;
+        }
+
+        if (FindExistingEmailByHash(tenantId, provider, messageHash) is { } existingByHash)
+        {
+            return existingByHash;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var extraction = new LegalExtraction(
+            LegalActType.Unknown,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            "Correo no legal omitido por filtro de inbox.",
+            false,
+            "Normal",
+            0.90m,
+            "Correo omitido: no contiene senales suficientes de SATJE, Fiscalia o actuacion judicial.",
+            string.Empty,
+            string.Empty,
+            ["ignored-non-legal"],
+            [],
+            []);
+
+        var email = new LegalEmail(
+            Guid.NewGuid(),
+            tenantId,
+            envelope.MailboxConnectionId,
+            null,
+            provider,
+            externalMessageId,
+            subject,
+            sender,
+            envelope.Recipients ?? [],
+            bodyText,
+            SafeRawReference(envelope.RawReference) ?? provider.ToString(),
+            envelope.ReceivedAt ?? now,
+            "IgnoredNonLegal",
+            extraction,
+            now,
+            messageHash,
+            false,
+            null);
+
+        store.Write(() =>
+        {
+            store.Emails.Insert(0, email);
+            store.MailProcessingLogs.Insert(0, new MailProcessingLog(Guid.NewGuid(), tenantId, envelope.MailboxConnectionId, email.Id, provider, "webhook-ingest", "IgnoredNonLegal", "Correo omitido por filtro legal.", 1, now, null));
+        });
         return email;
     }
 
@@ -764,6 +929,131 @@ public sealed class LegalWorkflowService(
         return TokenService.Sha256(basis);
     }
 
+    private static bool ExtractionUsedFallback(LegalExtraction extraction)
+    {
+        return extraction.Signals.Any(s => s.Equals("fallback-local-heuristic", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string PrepareBodyOrThrow(string? body)
+    {
+        var text = HtmlSanitizer.ToLegalInnerText(body);
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            throw new ArgumentException("Cuerpo es obligatorio.");
+        }
+
+        if (text.Length > HtmlSanitizer.MaxStoredBodyCharacters)
+        {
+            throw new ArgumentException($"Cuerpo saneado supera {HtmlSanitizer.MaxStoredBodyCharacters} caracteres.");
+        }
+
+        return text;
+    }
+
+    private static string SafeSubject(string? value)
+    {
+        var text = CollapseInlineWhitespace(HtmlSanitizer.ToLegalInnerText(value));
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            text = "(sin asunto)";
+        }
+
+        return Truncate(text, 240);
+    }
+
+    private static string SafeSender(string? value, MailProvider provider)
+    {
+        var text = CollapseInlineWhitespace(HtmlSanitizer.ToLegalInnerText(value));
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            text = provider.ToString();
+        }
+
+        return Truncate(text, 254);
+    }
+
+    private static string? SafeExternalMessageId(string? value)
+    {
+        value = CollapseInlineWhitespace(value ?? string.Empty);
+        return string.IsNullOrWhiteSpace(value) ? null : Truncate(value, 180);
+    }
+
+    private static string? SafeRawReference(string? value)
+    {
+        value = CollapseInlineWhitespace(value ?? string.Empty);
+        return string.IsNullOrWhiteSpace(value) ? null : Truncate(value, 200);
+    }
+
+    private static string Truncate(string value, int maxLength) => value.Length <= maxLength ? value : value[..maxLength];
+
+    private static string CollapseInlineWhitespace(string value)
+    {
+        return string.Join(' ', value.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+    }
+
+    private static bool LooksLikeLegalNotification(string subject, string sender, string body)
+    {
+        var normalized = RemoveDiacritics($"{sender}\n{subject}\n{body}").ToLowerInvariant();
+        var score = 0;
+        string[] strong =
+        [
+            "funcion judicial",
+            "satje",
+            "fiscalia general",
+            "expediente fiscal",
+            "investigacion previa",
+            "juicio no",
+            "proceso numero",
+            "casillero judicial",
+            "unidad judicial",
+            "codigo organico integral penal",
+            " coip",
+            "providencia",
+            "oficiese",
+            "cumplase"
+        ];
+        string[] weak =
+        [
+            "notificacion",
+            "audiencia",
+            "plazo",
+            "termino",
+            "pericia",
+            "versiones fiscalia",
+            "diligencia",
+            "juez",
+            "secretario"
+        ];
+
+        score += strong.Count(normalized.Contains) * 2;
+        score += weak.Count(normalized.Contains);
+        return score >= 2;
+    }
+
+    private void NotifyProcessingIssue(LegalEmail email, string message)
+    {
+        var responsible = store.Read(() => store.Users.FirstOrDefault(u =>
+            u.TenantId == email.TenantId &&
+            u.IsActive &&
+            (u.Roles.Contains(UserRole.Lawyer) || u.Roles.Contains(UserRole.SuperAdmin)))?.Id);
+        if (responsible is null)
+        {
+            return;
+        }
+
+        store.Write(() => store.Notifications.Insert(0, new Notification(
+            Guid.NewGuid(),
+            email.TenantId,
+            responsible.Value,
+            NotificationChannel.Panel,
+            "Correo requiere revision manual",
+            message,
+            NotificationStatus.Sent,
+            DateTimeOffset.UtcNow,
+            DateTimeOffset.UtcNow,
+            null)));
+    }
+
     private void EnsureCaseAndMailbox(Guid tenantId, Guid? caseId, Guid? mailboxConnectionId)
     {
         store.Read(() =>
@@ -828,23 +1118,43 @@ public sealed class LegalWorkflowService(
         var holidays = store.Read(() => store.Holidays.Where(h => h.TenantId == email.TenantId).ToArray());
         CreateInboxNotification(email, responsible);
 
-        if (email.Extraction.TermDays.HasValue && !store.Read(() => store.Deadlines.Any(d => d.TenantId == email.TenantId && d.LegalEmailId == email.Id)))
+        var extractedDeadlines = (email.Extraction.Deadlines is { Count: > 0 }
+                ? email.Extraction.Deadlines
+                : email.Extraction.TermDays.HasValue
+                    ? [new ExtractedDeadline(email.Extraction.TermDays.Value, null, email.Extraction.Obligation)]
+                    : [])
+            .Where(d => d.GrantedDays.HasValue || d.GrantedHours.HasValue)
+            .ToArray();
+
+        foreach (var extractedDeadline in extractedDeadlines)
         {
+            var termDays = extractedDeadline.GrantedDays ?? Math.Clamp((int)Math.Ceiling((extractedDeadline.GrantedHours ?? 24) / 24m), 1, 180);
             var notificationDate = DateOnly.FromDateTime(email.ReceivedAt.ToOffset(TimeSpan.FromHours(-5)).Date);
+            var title = BuildDeadlineTitle(email.Subject, extractedDeadline);
+            var exists = store.Read(() => store.Deadlines.Any(d =>
+                d.TenantId == email.TenantId &&
+                d.LegalEmailId == email.Id &&
+                d.TermDays == termDays &&
+                d.Title.Equals(title, StringComparison.OrdinalIgnoreCase)));
+            if (exists)
+            {
+                continue;
+            }
+
             var calculation = deadlineEngine.Calculate(
-                new DeadlineRequest(notificationDate, InputGuard.TermDays(email.Extraction.TermDays.Value), "general"),
+                new DeadlineRequest(notificationDate, InputGuard.TermDays(termDays), "general"),
                 holidays);
 
-            var status = email.Extraction.Confidence >= 0.70m ? DeadlineStatus.Confirmed : DeadlineStatus.PendingReview;
+            var status = !email.ProcessedWithFallback && email.Extraction.Confidence >= 0.70m ? DeadlineStatus.Confirmed : DeadlineStatus.PendingReview;
             var deadline = new Deadline(
                 Guid.NewGuid(),
                 email.TenantId,
                 email.CaseId,
                 email.Id,
-                $"Plazo: {email.Subject}",
+                title,
                 email.Extraction.ActType,
                 notificationDate,
-                email.Extraction.TermDays.Value,
+                termDays,
                 calculation.DueDate,
                 status,
                 responsible,
@@ -866,43 +1176,101 @@ public sealed class LegalWorkflowService(
                 starts,
                 starts.AddMinutes(30),
                 responsible,
-                !AutoConfirmDerivedCalendar(email.Extraction.Confidence));
+                email.ProcessedWithFallback || !AutoConfirmDerivedCalendar(email.Extraction.Confidence));
             CreateReminderSet(email.TenantId, calendarEvent, deadline.Title, holidays);
         }
 
-        if (email.Extraction.EventDate.HasValue && email.Extraction.ActType is LegalActType.Hearing or LegalActType.ExpertReview or LegalActType.ProsecutorNotification)
-        {
-            var time = email.Extraction.EventTime ?? new TimeOnly(9, 0);
-            var starts = ToQuitoDateTimeOffset(email.Extraction.EventDate.Value, time);
-            var type = email.Extraction.ActType switch
-            {
-                LegalActType.Hearing => CalendarEventType.Hearing,
-                LegalActType.ExpertReview => CalendarEventType.ExpertReview,
-                _ => CalendarEventType.Diligence
-            };
+        var extractedHearings = (email.Extraction.Hearings is { Count: > 0 }
+                ? email.Extraction.Hearings
+                : email.Extraction.EventDate.HasValue
+                    ? [new ExtractedHearing(email.Extraction.EventDate, email.Extraction.EventTime, email.Extraction.ActType.ToString(), email.Extraction.Location, null)]
+                    : [])
+            .Where(h => h.Date.HasValue)
+            .ToArray();
 
-            var title = $"{email.Extraction.ActType}: {email.Subject}";
+        foreach (var hearing in extractedHearings)
+        {
+            var time = hearing.Time ?? new TimeOnly(9, 0);
+            var starts = ToQuitoDateTimeOffset(hearing.Date!.Value, time);
+            var type = ResolveCalendarEventType(email.Extraction.ActType, hearing.Type);
+
+            var title = BuildHearingTitle(email.Subject, hearing, type);
             var exists = store.Read(() => store.CalendarEvents.Any(e =>
                 e.TenantId == email.TenantId &&
                 e.CaseId == email.CaseId &&
                 e.StartsAt == starts &&
                 e.Title.Equals(title, StringComparison.OrdinalIgnoreCase)));
 
-            if (!exists)
+            if (exists)
             {
-                var calendarEvent = CreateCalendarEvent(
-                    email,
-                    null,
-                    type,
-                    title,
-                    email.Extraction.Location,
-                    starts,
-                    starts.AddHours(1),
-                    responsible,
-                    !AutoConfirmDerivedCalendar(email.Extraction.Confidence));
-                CreateReminderSet(email.TenantId, calendarEvent, title, holidays);
+                continue;
+            }
+
+            var calendarEvent = CreateCalendarEvent(
+                email,
+                null,
+                type,
+                title,
+                hearing.LinkZoom ?? hearing.Location ?? email.Extraction.Location,
+                starts,
+                starts.AddHours(1),
+                responsible,
+                email.ProcessedWithFallback || !AutoConfirmDerivedCalendar(email.Extraction.Confidence));
+            CreateReminderSet(email.TenantId, calendarEvent, title, holidays);
+        }
+    }
+
+    private static CalendarEventType ResolveCalendarEventType(LegalActType actType, string? hearingType)
+    {
+        var normalized = RemoveDiacritics(hearingType ?? string.Empty).ToLowerInvariant();
+        if (normalized.Contains("pericia") || actType == LegalActType.ExpertReview)
+        {
+            return CalendarEventType.ExpertReview;
+        }
+
+        if (normalized.Contains("version") || normalized.Contains("fiscalia") || actType == LegalActType.ProsecutorNotification)
+        {
+            return CalendarEventType.Diligence;
+        }
+
+        return actType switch
+            {
+                LegalActType.Hearing => CalendarEventType.Hearing,
+                LegalActType.ExpertReview => CalendarEventType.ExpertReview,
+                _ => CalendarEventType.Diligence
+            };
+    }
+
+    private static string BuildDeadlineTitle(string subject, ExtractedDeadline deadline)
+    {
+        var condition = string.IsNullOrWhiteSpace(deadline.Condition)
+            ? subject
+            : deadline.Condition;
+        var unit = deadline.GrantedDays.HasValue
+            ? $"{deadline.GrantedDays.Value} dias"
+            : $"{deadline.GrantedHours ?? 0} horas";
+        return Truncate($"Plazo {unit}: {condition}", 180);
+    }
+
+    private static string BuildHearingTitle(string subject, ExtractedHearing hearing, CalendarEventType type)
+    {
+        var label = string.IsNullOrWhiteSpace(hearing.Type) ? type.ToString() : hearing.Type;
+        return Truncate($"{label}: {subject}", 180);
+    }
+
+    private static string RemoveDiacritics(string text)
+    {
+        var normalized = text.Normalize(NormalizationForm.FormD);
+        var builder = new StringBuilder(normalized.Length);
+        foreach (var c in normalized)
+        {
+            if (CharUnicodeInfo.GetUnicodeCategory(c) != UnicodeCategory.NonSpacingMark)
+            {
+                builder.Append(c);
             }
         }
+
+        return builder.ToString().Normalize(NormalizationForm.FormC);
     }
 
     private bool AutoConfirmDerivedCalendar(decimal confidence)
@@ -1138,7 +1506,7 @@ public sealed class LegalWorkflowService(
         }
 
         var combined = $"{bodyText}\n\n--- Texto extraido de adjuntos ---\n{string.Join("\n\n", readable)}";
-        return combined.Length <= 12000 ? combined : combined[..12000];
+        return HtmlSanitizer.ClipForAnalysis(combined);
     }
 
     private static DateTimeOffset ToQuitoDateTimeOffset(DateOnly date, TimeOnly time)
@@ -1153,7 +1521,7 @@ public static class DocumentTextExtractor
     {
         if (!string.IsNullOrWhiteSpace(providedText))
         {
-            return InputGuard.TextBlock(providedText, "Texto OCR", 12000);
+            return HtmlSanitizer.ClipForAnalysis(HtmlSanitizer.ToLegalInnerText(providedText));
         }
 
         if (contentType.StartsWith("text/", StringComparison.OrdinalIgnoreCase) ||
@@ -1202,7 +1570,7 @@ public static class DocumentTextExtractor
     private static string TrimForIndex(string value)
     {
         value = value.Trim();
-        return value.Length <= 12000 ? value : value[..12000];
+        return HtmlSanitizer.ClipForAnalysis(value);
     }
 }
 
@@ -2010,7 +2378,7 @@ public sealed class ReportService(LegalPilotStore store)
                 cases = store.Cases.Count(c => c.TenantId == principal.TenantId),
                 clients = store.Clients.Count(c => c.TenantId == principal.TenantId),
                 mailboxes = store.Mailboxes.Count(m => m.TenantId == principal.TenantId),
-                emails = store.Emails.Count(e => e.TenantId == principal.TenantId),
+                emails = store.Emails.Count(e => e.TenantId == principal.TenantId && e.ProcessingStatus != "IgnoredNonLegal"),
                 deadlines = deadlines.Length,
                 deadlinesDueSoon = deadlines.Count(d => d.DueDate <= today.AddDays(3) && d.Status is DeadlineStatus.Confirmed or DeadlineStatus.PendingReview),
                 pendingReview = deadlines.Count(d => d.Status == DeadlineStatus.PendingReview),

@@ -54,7 +54,13 @@ public sealed class LegalAiPipelineService(
     {
         HttpAuth.RequireRole(principal, UserRole.SuperAdmin, UserRole.Lawyer, UserRole.Assistant);
         var subject = InputGuard.Required(request.Subject, "Asunto", 240);
-        var body = InputGuard.TextBlock(request.BodyText, "Texto", 12000);
+        var body = HtmlSanitizer.ToLegalInnerText(request.BodyText);
+        if (string.IsNullOrWhiteSpace(body))
+        {
+            throw new ArgumentException("Texto es obligatorio.");
+        }
+
+        body = HtmlSanitizer.ClipForAnalysis(body);
         var extraction = intelligence.Extract(subject, body);
         var output = new
         {
@@ -167,6 +173,8 @@ public sealed class LegalAiPipelineService(
                     e.Extraction.EventTime,
                     e.Extraction.Location,
                     e.Extraction.TermDays,
+                    e.Extraction.Hearings,
+                    e.Extraction.Deadlines,
                     e.Extraction.Obligation,
                     e.Extraction.RequiresResponse,
                     e.Extraction.Priority,

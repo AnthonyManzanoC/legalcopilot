@@ -269,7 +269,7 @@ app.MapGet("/api/cases/{id:guid}", (HttpRequest request, TokenService tokens, Le
         client = legalCase.ClientId.HasValue ? store.Read(() => store.Clients.FirstOrDefault(c => c.Id == legalCase.ClientId.Value)) : null,
         deadlines = store.Read(() => store.Deadlines.Where(d => d.CaseId == id && d.TenantId == principal.TenantId).OrderBy(d => d.DueDate).ToArray()),
         events = store.Read(() => store.CalendarEvents.Where(e => e.CaseId == id && e.TenantId == principal.TenantId).OrderBy(e => e.StartsAt).ToArray()),
-        emails = store.Read(() => store.Emails.Where(e => e.CaseId == id && e.TenantId == principal.TenantId).OrderByDescending(e => e.ReceivedAt).ToArray())
+        emails = store.Read(() => store.Emails.Where(e => e.CaseId == id && e.TenantId == principal.TenantId && e.ProcessingStatus != "IgnoredNonLegal").OrderByDescending(e => e.ReceivedAt).ToArray())
     });
 });
 
@@ -325,7 +325,7 @@ app.MapPost("/api/mailboxes/connect", (HttpRequest request, TokenService tokens,
 app.MapPost("/api/mailboxes/{id:guid}/sync", async (HttpRequest request, TokenService tokens, MailboxService mailboxes, Guid id, CancellationToken cancellationToken) =>
 {
     var principal = HttpAuth.RequirePrincipal(request, tokens);
-    return Results.Accepted($"/api/mailboxes/{id}/sync", await mailboxes.Sync(principal, id, cancellationToken));
+    return Results.Ok(await mailboxes.Sync(principal, id, cancellationToken));
 });
 
 app.MapPatch("/api/mailboxes/{id:guid}/calendar", (HttpRequest request, TokenService tokens, MailboxService mailboxes, Guid id, UpdateMailboxCalendarRequest payload) =>
@@ -420,6 +420,7 @@ app.MapGet("/api/inbox", (HttpRequest request, TokenService tokens, LegalPilotSt
     var principal = HttpAuth.RequirePrincipal(request, tokens);
     return Results.Ok(store.Read(() => store.Emails
         .Where(e => e.TenantId == principal.TenantId)
+        .Where(e => e.ProcessingStatus != "IgnoredNonLegal")
         .OrderByDescending(e => e.ReceivedAt)
         .Take(100)
         .Select(e => new
@@ -702,7 +703,7 @@ app.MapGet("/api/status", (HttpRequest request, TokenService tokens, LegalPilotS
             users = store.Users.Count(u => u.TenantId == principal.TenantId),
             clients = store.Clients.Count(c => c.TenantId == principal.TenantId),
             cases = store.Cases.Count(c => c.TenantId == principal.TenantId),
-            emails = store.Emails.Count(e => e.TenantId == principal.TenantId),
+            emails = store.Emails.Count(e => e.TenantId == principal.TenantId && e.ProcessingStatus != "IgnoredNonLegal"),
             deadlines = store.Deadlines.Count(d => d.TenantId == principal.TenantId),
             calendarEvents = store.CalendarEvents.Count(e => e.TenantId == principal.TenantId),
             auditEntries = store.AuditEntries.Count(a => a.TenantId == principal.TenantId),

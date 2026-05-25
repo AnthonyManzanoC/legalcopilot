@@ -149,7 +149,11 @@
           <div class="panel">
             <div class="panel-head">
               <h2>Correos procesados</h2>
-              <button class="compact" data-refresh="inbox">Actualizar</button>
+              <div class="actions">
+                <button class="compact ghost inline" data-connect-provider="Gmail">Gmail OAuth</button>
+                <button class="compact ghost inline" data-connect-provider="Outlook">Microsoft OAuth</button>
+                <button class="compact" data-refresh="inbox">Actualizar</button>
+              </div>
             </div>
             <div id="inboxList" class="list"></div>
           </div>

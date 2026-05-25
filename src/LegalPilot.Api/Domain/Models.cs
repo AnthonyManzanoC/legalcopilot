@@ -144,7 +144,21 @@ public sealed record LegalExtraction(
     string LawyerSummary,
     string ClientSummary,
     string SuggestedDraft,
-    string[] Signals);
+    string[] Signals,
+    IReadOnlyList<ExtractedHearing>? Hearings = null,
+    IReadOnlyList<ExtractedDeadline>? Deadlines = null);
+
+public sealed record ExtractedHearing(
+    DateOnly? Date,
+    TimeOnly? Time,
+    string? Type,
+    string? Location,
+    string? LinkZoom);
+
+public sealed record ExtractedDeadline(
+    int? GrantedDays,
+    int? GrantedHours,
+    string? Condition);
 
 public sealed record Holiday(
     Guid Id,

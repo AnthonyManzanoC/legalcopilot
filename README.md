@@ -97,6 +97,41 @@ Variables principales:
 - `LegalPilot__Calendar__PreferredProvider`: `auto`, `Gmail` u `Outlook` para sincronizacion externa.
 - `LegalPilot__AI__Provider`, `Model`, `EmbeddingModel`, `ApiKey`: proveedor IA/RAG cuando se conecte un gateway LLM.
 
+## Puesta en produccion real
+
+1. Configure almacenamiento real:
+   - `LEGALPILOT_DATABASE_URL=postgresql://...` de Supabase.
+   - `LEGALPILOT_STORAGE_REQUIRE_POSTGRES=true`.
+   - `LEGALPILOT_MIGRATE_LOCAL_JSON=false` salvo migracion puntual.
+2. Configure admin real:
+   - `LEGALPILOT_BOOTSTRAP_TENANT_NAME=Nombre del estudio`.
+   - `LEGALPILOT_BOOTSTRAP_ADMIN_EMAIL=correo real`.
+   - `LEGALPILOT_BOOTSTRAP_ADMIN_PASSWORD=contrasena fuerte`.
+   - Al reiniciar, el bootstrap elimina datos demo/QA conocidos y deja el admin real.
+3. Configure seguridad:
+   - `LEGALPILOT_TOKEN_SIGNING_KEY` con 64+ caracteres aleatorios.
+   - `LEGALPILOT_DATA_PROTECTION_KEY` con 32+ caracteres aleatorios para cifrar tokens OAuth.
+4. Configure Gemini:
+   - `LEGALPILOT_AI_PROVIDER=gemini`.
+   - `LEGALPILOT_AI_MODEL=gemini-1.5-pro` o el modelo Gemini productivo que habilite su cuenta.
+   - `GEMINI_API_KEY` o `LEGALPILOT_AI_API_KEY`.
+5. Configure Gmail OAuth:
+   - En Google Cloud, cree OAuth Client Web y agregue redirect URI `https://SU-DOMINIO/api/auth/gmail/callback`.
+   - Complete `LEGALPILOT_GMAIL_CLIENT_ID`, `LEGALPILOT_GMAIL_CLIENT_SECRET`, `LEGALPILOT_GMAIL_REDIRECT_URI`.
+   - Configure Pub/Sub topic y complete `LEGALPILOT_GMAIL_PUBSUB_TOPIC_NAME`.
+6. Configure Microsoft OAuth:
+   - En Azure App Registration, agregue redirect URI `https://SU-DOMINIO/api/auth/microsoft/callback`.
+   - Complete `LEGALPILOT_MICROSOFT_CLIENT_ID`, `LEGALPILOT_MICROSOFT_CLIENT_SECRET`, `LEGALPILOT_MICROSOFT_TENANT_ID`.
+   - Complete `LEGALPILOT_MICROSOFT_WEBHOOK_NOTIFICATION_URL=https://SU-DOMINIO/api/webhooks/microsoft` y un `LEGALPILOT_MICROSOFT_WEBHOOK_CLIENT_STATE` secreto.
+7. Configure OpenWA:
+   - Levante su servidor OpenWA/WhatsApp con API HTTP.
+   - Complete `LEGALPILOT_OPENWA_BASE_URL`, `LEGALPILOT_OPENWA_API_KEY`, `LEGALPILOT_OPENWA_SESSION_ID`, `LEGALPILOT_OPENWA_WEBHOOK_SECRET`.
+   - Configure el webhook de OpenWA hacia `https://SU-DOMINIO/api/webhooks/openwa`.
+8. Entre al panel:
+   - Abra `Integraciones` o use los botones OAuth del `Inbox legal`.
+   - Conecte Gmail/Microsoft, seleccione calendario predeterminado si aplica y ejecute `Sincronizar`.
+   - Los correos no legales quedan omitidos del inbox; SATJE/Fiscalia generan plazos, agenda, alertas y recordatorios.
+
 ## Endpoints principales
 
 - `GET /health`

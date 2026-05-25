@@ -8,6 +8,7 @@ using Microsoft.Extensions.Logging;
 
 TestPasswordHasher();
 TestLegalIntelligence();
+TestEcuadorAdvancedJudicialModels();
 TestDeadlineEngineWithEcuadorHoliday();
 TestBusinessDayOverride();
 TestWorkflowAuditReminderAndSanitization();
@@ -40,6 +41,44 @@ static void TestLegalIntelligence()
     Assert(extraction.TermDays == 5, "Term days should be extracted.");
     Assert(extraction.ActType is LegalActType.Hearing or LegalActType.Ruling, "Legal act type should be classified.");
     Assert(extraction.Confidence >= 0.75m, "Extraction confidence should reflect multiple signals.");
+}
+
+static void TestEcuadorAdvancedJudicialModels()
+{
+    var service = new LegalIntelligenceService();
+    var satje = service.Extract(
+        "SATJE MIXTO EXTREMO",
+        """
+        Usted ha recibido una notificacion en su casillero electronico del proceso numero 12282202428720
+        UNIDAD JUDICIAL PENAL CON SEDE EN EL CANTON BABAHOYO
+        VISTOS. Puesto a mi despacho el proceso N° 12282-2024-28720.
+        PRIMERO. Se REVOCA la providencia anterior y se deja sin efecto la audiencia convocada para el dia 03 de junio.
+        SEGUNDO. En su reemplazo, se senala nueva fecha para la AUDIENCIA DE EVALUACION Y PREPARATORIA DE JUICIO, para el DIA 15 DE JUNIO DE 2026, A LAS 10H00.
+        TERCERO. Se concede a la parte acusadora el plazo de TRES (3) DIAS para que se pronuncie sobre el peritaje agregado.
+        CUARTO. Se le otorga a la defensa tecnica el plazo de CINCO (5) DIAS para que singularice la prueba testimonial.
+        ***************** UTILIDAD SOLO PARA INFORMACION *********************
+        """);
+
+    Assert(satje.CaseNumber == "12282202428720", "SATJE compact case number should be extracted.");
+    Assert(satje.Hearings?.Count == 1, $"SATJE mixed model should extract the new hearing date only. Count={satje.Hearings?.Count ?? 0}; Dates={string.Join(",", satje.Hearings?.Select(h => $"{h.Date:yyyy-MM-dd} {h.Time:HH:mm} {h.Type}") ?? [])}");
+    Assert(satje.Hearings![0].Date == new DateOnly(2026, 6, 15), "SATJE deferred hearing should use the new date.");
+    Assert(satje.Hearings[0].Time == new TimeOnly(10, 0), "SATJE H-format time should be parsed.");
+    Assert(satje.Deadlines?.Count == 2, "SATJE mixed model should extract crossed deadlines.");
+
+    var fiscalia = service.Extract(
+        "notificacion",
+        """
+        EXPEDIENTE FISCAL No. 120301824010025
+        FISCALIA GENERAL DEL ESTADO.- FISCALIA DE MONTALVO.
+        1).- solicito VERSIONES FISCALIA: Se senala dia y hora para que comparezca CORONEL MONAR RUTH DEL ROCIO, LUGAR Y FECHA DONDE SE VA REALIZAR LA DILIGENCIA: FECHA.- 2026-06-02 HORA.- 09:00
+        2).- solicito VERSIONES FISCALIA: Se senala dia y hora para que comparezca ZAMBRANO PICO CARLOS ANDRES, LUGAR Y FECHA DONDE SE VA REALIZAR LA DILIGENCIA: FECHA.- 2026-06-02 HORA.- 10:30
+        3).- solicito VERSIONES FISCALIA: Se senala dia y hora para que comparezca MANZANO BAYAS JULIO RODRIGO, LUGAR Y FECHA DE LA DILIGENCIA: FECHA.- 2026-06-02 HORA.- 14:00
+        4).- solicito REQUERIMIENTO DE INFORMACION: Se concede el plazo de CINCO (5) DIAS a la entidad bancaria.
+        """);
+
+    Assert(fiscalia.CaseNumber == "120301824010025", "Fiscalia compact expediente should be extracted.");
+    Assert(fiscalia.Hearings?.Count == 3, "Fiscalia multiple versions should create three scheduled diligences.");
+    Assert(fiscalia.Deadlines?.Count == 1, "Fiscalia mixed model should extract the information deadline.");
 }
 
 static void TestDeadlineEngineWithEcuadorHoliday()
