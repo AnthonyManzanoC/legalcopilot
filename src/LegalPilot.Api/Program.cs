@@ -47,6 +47,7 @@ builder.Services.AddSingleton<ExternalCalendarSyncService>();
 builder.Services.AddSingleton<WhatsAppService>();
 builder.Services.AddSingleton<ChatService>();
 builder.Services.AddSingleton<ReportService>();
+builder.Services.AddHttpClient("gemini", client => client.Timeout = TimeSpan.FromSeconds(180));
 builder.Services.AddHttpClient<OpenWaClient>();
 builder.Services.AddHostedService<ReminderDispatcher>();
 builder.Services.AddHostedService<MailboxSyncWorker>();

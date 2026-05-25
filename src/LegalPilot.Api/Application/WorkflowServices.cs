@@ -551,7 +551,9 @@ public sealed class LegalWorkflowService(
     LegalPilotStore store,
     LegalIntelligenceService intelligence,
     EcuadorDeadlineEngine deadlineEngine,
-    IConfiguration configuration)
+    IConfiguration configuration,
+    ExternalCalendarSyncService? externalCalendars = null,
+    ILogger<LegalWorkflowService>? logger = null)
 {
     public LegalEmail IngestManual(AuthPrincipal principal, ManualEmailRequest request)
     {
@@ -585,6 +587,7 @@ public sealed class LegalWorkflowService(
         var extraction = intelligence.Extract(subject, HtmlSanitizer.ClipForAnalysis(analysisBody));
         var caseId = ResolveCaseId(principal.TenantId, extraction.CaseNumber, request.CaseId);
         var processedWithFallback = ExtractionUsedFallback(extraction);
+        var canAutoProcess = CanAutoConfirmExtraction(caseId, extraction);
         var now = DateTimeOffset.UtcNow;
 
         var email = new LegalEmail(
@@ -600,7 +603,7 @@ public sealed class LegalWorkflowService(
             storedBody,
             InputGuard.Optional(request.RawReference, 200) is { Length: > 0 } rawReference ? rawReference : "manual",
             request.ReceivedAt ?? now,
-            processedWithFallback ? "RequiresManualReview" : "Processed",
+            processedWithFallback && !canAutoProcess ? "RequiresManualReview" : "Processed",
             extraction,
             now,
             messageHash,
@@ -666,6 +669,7 @@ public sealed class LegalWorkflowService(
         var extraction = intelligence.Extract(subject, HtmlSanitizer.ClipForAnalysis(analysisBody));
         var caseId = ResolveCaseId(tenantId, extraction.CaseNumber, null);
         var processedWithFallback = ExtractionUsedFallback(extraction);
+        var canAutoProcess = CanAutoConfirmExtraction(caseId, extraction);
         var now = DateTimeOffset.UtcNow;
         var email = new LegalEmail(
             emailId,
@@ -680,7 +684,7 @@ public sealed class LegalWorkflowService(
             storedBody,
             InputGuard.Optional(envelope.RawReference, 200) is { Length: > 0 } rawReference ? rawReference : provider.ToString(),
             envelope.ReceivedAt ?? now,
-            processedWithFallback ? "RequiresManualReview" : "ProcessedFromWebhook",
+            processedWithFallback && !canAutoProcess ? "RequiresManualReview" : "ProcessedFromWebhook",
             extraction,
             now,
             messageHash,
@@ -901,6 +905,7 @@ public sealed class LegalWorkflowService(
             request.Confirmed ? "Pending" : "NeedsConfirmation");
         store.Write(() => store.CalendarEvents.Insert(0, calendarEvent));
         CreateReminderSet(principal.TenantId, calendarEvent, deadline.Title, holidays);
+        QueueExternalCalendarSync(calendarEvent, responsible);
         return deadline;
     }
 
@@ -1116,6 +1121,7 @@ public sealed class LegalWorkflowService(
 
         var responsible = ResolveResponsible(email);
         var holidays = store.Read(() => store.Holidays.Where(h => h.TenantId == email.TenantId).ToArray());
+        var autoConfirmDerivedWork = CanAutoConfirmDerivedWork(email);
         CreateInboxNotification(email, responsible);
 
         var extractedDeadlines = (email.Extraction.Deadlines is { Count: > 0 }
@@ -1145,7 +1151,7 @@ public sealed class LegalWorkflowService(
                 new DeadlineRequest(notificationDate, InputGuard.TermDays(termDays), "general"),
                 holidays);
 
-            var status = !email.ProcessedWithFallback && email.Extraction.Confidence >= 0.70m ? DeadlineStatus.Confirmed : DeadlineStatus.PendingReview;
+            var status = autoConfirmDerivedWork ? DeadlineStatus.Confirmed : DeadlineStatus.PendingReview;
             var deadline = new Deadline(
                 Guid.NewGuid(),
                 email.TenantId,
@@ -1176,8 +1182,9 @@ public sealed class LegalWorkflowService(
                 starts,
                 starts.AddMinutes(30),
                 responsible,
-                email.ProcessedWithFallback || !AutoConfirmDerivedCalendar(email.Extraction.Confidence));
+                !autoConfirmDerivedWork);
             CreateReminderSet(email.TenantId, calendarEvent, deadline.Title, holidays);
+            QueueExternalCalendarSync(calendarEvent, responsible);
         }
 
         var extractedHearings = (email.Extraction.Hearings is { Count: > 0 }
@@ -1215,8 +1222,9 @@ public sealed class LegalWorkflowService(
                 starts,
                 starts.AddHours(1),
                 responsible,
-                email.ProcessedWithFallback || !AutoConfirmDerivedCalendar(email.Extraction.Confidence));
+                !autoConfirmDerivedWork);
             CreateReminderSet(email.TenantId, calendarEvent, title, holidays);
+            QueueExternalCalendarSync(calendarEvent, responsible);
         }
     }
 
@@ -1273,14 +1281,33 @@ public sealed class LegalWorkflowService(
         return builder.ToString().Normalize(NormalizationForm.FormC);
     }
 
-    private bool AutoConfirmDerivedCalendar(decimal confidence)
+    private bool CanAutoConfirmDerivedWork(LegalEmail email)
+    {
+        return email.Extraction is not null && CanAutoConfirmExtraction(email.CaseId, email.Extraction);
+    }
+
+    private bool CanAutoConfirmExtraction(Guid? caseId, LegalExtraction extraction)
     {
         var configured = configuration["LegalPilot:Automation:AutoConfirmDerivedCalendar"];
         var enabled = string.IsNullOrWhiteSpace(configured) ||
                       string.Equals(configured, "true", StringComparison.OrdinalIgnoreCase);
         var thresholdText = configuration["LegalPilot:Automation:AutoConfirmMinConfidence"];
-        var threshold = decimal.TryParse(thresholdText, out var parsed) ? parsed : 0.70m;
-        return enabled && confidence >= threshold;
+        var threshold = decimal.TryParse(thresholdText, NumberStyles.Number, CultureInfo.InvariantCulture, out var parsed) ? parsed : 0.70m;
+        return enabled &&
+               extraction.Confidence >= threshold &&
+               HasCompleteAutomationEvidence(caseId, extraction);
+    }
+
+    private static bool HasCompleteAutomationEvidence(Guid? caseId, LegalExtraction extraction)
+    {
+        var hasCase = caseId.HasValue || !string.IsNullOrWhiteSpace(extraction.CaseNumber);
+        var hasType = extraction.ActType != LegalActType.Unknown;
+        var hasEventDate = extraction.EventDate.HasValue ||
+                           extraction.Hearings?.Any(h => h.Date.HasValue) == true;
+        var hasDeadlineTerm = extraction.TermDays is > 0 ||
+                              extraction.Deadlines?.Any(d => d.GrantedDays is > 0 || d.GrantedHours is > 0) == true;
+
+        return hasCase && hasType && (hasEventDate || hasDeadlineTerm);
     }
 
     private Guid ResolveResponsible(LegalEmail email)
@@ -1331,6 +1358,59 @@ public sealed class LegalWorkflowService(
         store.Write(() => store.CalendarEvents.Insert(0, calendarEvent));
         store.Audit(email.TenantId, responsible, AuditAction.CreateCalendarEvent, nameof(CalendarEvent), calendarEvent.Id.ToString(), $"Evento creado: {title}");
         return calendarEvent;
+    }
+
+    private void QueueExternalCalendarSync(CalendarEvent calendarEvent, Guid actorUserId)
+    {
+        if (externalCalendars is null ||
+            !calendarEvent.Confirmed ||
+            calendarEvent.SyncStatus is not ("Pending" or "PendingUpdate"))
+        {
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var principal = ResolveAutomationPrincipal(calendarEvent.TenantId, actorUserId);
+                if (principal is null)
+                {
+                    logger?.LogWarning("Calendar event {EventId} could not sync automatically because no active automation user exists.", calendarEvent.Id);
+                    return;
+                }
+
+                var result = await externalCalendars.SyncEventAsync(principal, calendarEvent.Id, CancellationToken.None);
+                if (!result.Success)
+                {
+                    logger?.LogWarning("Calendar event {EventId} external sync finished with {Status}: {Message}", calendarEvent.Id, result.Status, result.Message);
+                }
+            }
+            catch (Exception ex)
+            {
+                logger?.LogError(ex, "Calendar event {EventId} failed during zero-touch external sync.", calendarEvent.Id);
+            }
+        });
+    }
+
+    private AuthPrincipal? ResolveAutomationPrincipal(Guid tenantId, Guid preferredUserId)
+    {
+        return store.Read(() =>
+        {
+            var user = store.Users.FirstOrDefault(u =>
+                u.Id == preferredUserId &&
+                u.TenantId == tenantId &&
+                u.IsActive);
+
+            user ??= store.Users.FirstOrDefault(u =>
+                u.TenantId == tenantId &&
+                u.IsActive &&
+                (u.Roles.Contains(UserRole.Lawyer) ||
+                 u.Roles.Contains(UserRole.SuperAdmin) ||
+                 u.Roles.Contains(UserRole.Assistant)));
+
+            return user is null ? null : new AuthPrincipal(user.Id, tenantId, user.Email, user.Roles);
+        });
     }
 
     private void CreateReminderSet(Guid tenantId, CalendarEvent calendarEvent, string title, IReadOnlyList<Holiday> holidays)

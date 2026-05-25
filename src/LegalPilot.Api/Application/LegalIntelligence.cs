@@ -8,6 +8,7 @@ namespace LegalPilot.Api.Application;
 
 public sealed class LegalIntelligenceService
 {
+    private static readonly TimeSpan GeminiTimeout = TimeSpan.FromSeconds(180);
     private static readonly Regex CaseNumberRegex = new(@"(?:(?:causa|proceso|juicio|expediente(?:\s+fiscal)?|investigacion previa|no\.?|nro\.?|n[°º])\s*[:#.-]?\s*)?(?<case>\d{5}-\d{4}-\d{5}|\d{13,16})", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex NumericDateRegex = new(@"\b(?<day>\d{1,2})[/-](?<month>\d{1,2})[/-](?<year>\d{4})\b|\b(?<year2>\d{4})-(?<month2>\d{1,2})-(?<day2>\d{1,2})\b", RegexOptions.Compiled);
     private static readonly Regex SpanishDateRegex = new(@"\b(?<day>\d{1,2})\s+de\s+(?<month>enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)\s+(?:de|del)\s+(?<year>\d{4})\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -207,7 +208,7 @@ public sealed class LegalIntelligenceService
 
         using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
         request.Content = new StringContent(JsonSerializer.Serialize(payload, Json), Encoding.UTF8, "application/json");
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        using var timeout = new CancellationTokenSource(GeminiTimeout);
         using var response = _httpClientFactory.CreateClient("gemini").Send(request, timeout.Token);
         var responseBody = response.Content.ReadAsStringAsync(timeout.Token).GetAwaiter().GetResult();
         if (!response.IsSuccessStatusCode)

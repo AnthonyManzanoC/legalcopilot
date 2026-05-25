@@ -234,7 +234,13 @@ public sealed class LegalAiPipelineService(
         {
             noDeadlineCalculationByLlm = true,
             deterministicDeadlineEngine = "EcuadorDeadlineEngine",
-            humanReviewRequiredForCriticalActions = true,
+            humanReviewRequiredForCriticalActions = "Solo cuando faltan datos minimos o confianza operativa; si hay causa, tipo y fecha/plazo, LegalPilot puede confirmar y sincronizar automaticamente.",
+            zeroTouchAutomation = new
+            {
+                autoConfirmDerivedCalendar = true,
+                externalCalendarSync = "Confirmado -> CalendarExternalSync inmediato",
+                geminiTimeoutSeconds = 180
+            },
             auditPromptsAndOutputs = true,
             piiProtection = "No enviar informacion sensible al cliente sin aprobacion del abogado."
         };

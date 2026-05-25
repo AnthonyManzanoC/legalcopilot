@@ -12,10 +12,11 @@ public sealed class WebhooksController(
     LegalWorkflowService workflow,
     MailboxService mailboxes,
     LegalPilotStore store,
-    IConfiguration configuration) : ControllerBase
+    IConfiguration configuration,
+    ILogger<WebhooksController> logger) : ControllerBase
 {
     [HttpPost("gmail")]
-    public async Task<IActionResult> Gmail([FromBody] GmailWebhookRequest payload, CancellationToken cancellationToken)
+    public IActionResult Gmail([FromBody] GmailWebhookRequest payload)
     {
         WebhookSecurity.RequireSharedSecret(Request, configuration, "LegalPilot:Gmail:WebhookSecret", "Gmail");
         var tenantId = store.Read(() => store.Tenants.First().Id);
@@ -27,10 +28,10 @@ public sealed class WebhooksController(
             e.Provider == MailProvider.Gmail &&
             e.ExternalEventId == externalEventId &&
             e.PayloadHash == payloadHash &&
-            e.Status == "Processed"));
+            e.Status is "Queued" or "Processing" or "Processed"));
         if (duplicate)
         {
-            return Accepted("/api/webhooks/gmail", new { accepted = true, action = "duplicate-webhook" });
+            return Ok(new { accepted = true, action = "duplicate-webhook" });
         }
 
         var envelope = WebhookParsers.FromGmailPubSub(payload);
@@ -40,21 +41,13 @@ public sealed class WebhooksController(
             m.Email.Equals(envelope.Sender, StringComparison.OrdinalIgnoreCase)));
         var webhookEventId = store.Write(() =>
         {
-            var item = new MailWebhookEvent(Guid.NewGuid(), tenantId, MailProvider.Gmail, mailbox?.Id, externalEventId, payloadHash, "Received", "Gmail Pub/Sub recibido.", DateTimeOffset.UtcNow, null);
+            var item = new MailWebhookEvent(Guid.NewGuid(), tenantId, MailProvider.Gmail, mailbox?.Id, externalEventId, payloadHash, "Queued", "Gmail Pub/Sub recibido; procesamiento en segundo plano encolado.", DateTimeOffset.UtcNow, null);
             store.MailWebhookEvents.Insert(0, item);
             return item.Id;
         });
 
-        var syncState = await mailboxes.SyncProviderFromWebhook(tenantId, MailProvider.Gmail, envelope.Sender, cancellationToken);
-        if (syncState is not null)
-        {
-            MarkWebhookProcessed(webhookEventId, $"Sync Gmail ejecutado: {syncState.Status}.");
-            return Accepted("/api/webhooks/gmail", new { accepted = true, action = "mailbox-sync", syncState.Id, syncState.Status, syncState.Message });
-        }
-
-        var email = workflow.IngestWebhook(tenantId, MailProvider.Gmail, envelope);
-        MarkWebhookProcessed(webhookEventId, $"Notificacion Gmail persistida como correo: {email.Id}.");
-        return Accepted("/api/webhooks/gmail", new { accepted = true, action = "stored-webhook-notification", email.Id });
+        QueueWebhookProcessing(tenantId, MailProvider.Gmail, envelope, webhookEventId, envelope.Sender);
+        return Ok(new { accepted = true, action = "queued-background-processing", webhookEventId });
     }
 
     [HttpGet("microsoft")]
@@ -75,39 +68,82 @@ public sealed class WebhooksController(
 
         using var document = await JsonDocument.ParseAsync(Request.Body, cancellationToken: cancellationToken);
         WebhookSecurity.RequireMicrosoftClientState(document.RootElement, configuration);
+        var root = document.RootElement.Clone();
         var tenantId = store.Read(() => store.Tenants.First().Id);
-        var raw = document.RootElement.GetRawText();
+        var raw = root.GetRawText();
         var payloadHash = TokenService.Sha256(raw);
-        var externalEventId = MicrosoftWebhookId(document.RootElement, payloadHash);
+        var externalEventId = MicrosoftWebhookId(root, payloadHash);
         var duplicate = store.Read(() => store.MailWebhookEvents.Any(e =>
             e.TenantId == tenantId &&
             e.Provider == MailProvider.Outlook &&
             e.ExternalEventId == externalEventId &&
             e.PayloadHash == payloadHash &&
-            e.Status == "Processed"));
+            e.Status is "Queued" or "Processing" or "Processed"));
         if (duplicate)
         {
-            return Accepted("/api/webhooks/microsoft", new { accepted = true, action = "duplicate-webhook" });
+            return Ok(new { accepted = true, action = "duplicate-webhook" });
         }
 
-        var mailbox = ResolveGraphMailbox(tenantId, document.RootElement);
+        var mailbox = ResolveGraphMailbox(tenantId, root);
         var webhookEventId = store.Write(() =>
         {
-            var item = new MailWebhookEvent(Guid.NewGuid(), tenantId, MailProvider.Outlook, mailbox?.Id, externalEventId, payloadHash, "Received", "Microsoft Graph webhook recibido.", DateTimeOffset.UtcNow, null);
+            var item = new MailWebhookEvent(Guid.NewGuid(), tenantId, MailProvider.Outlook, mailbox?.Id, externalEventId, payloadHash, "Queued", "Microsoft Graph webhook recibido; procesamiento en segundo plano encolado.", DateTimeOffset.UtcNow, null);
             store.MailWebhookEvents.Insert(0, item);
             return item.Id;
         });
 
-        var syncState = await mailboxes.SyncProviderFromWebhook(tenantId, MailProvider.Outlook, null, cancellationToken);
-        if (syncState is not null)
-        {
-            MarkWebhookProcessed(webhookEventId, $"Sync Microsoft ejecutado: {syncState.Status}.");
-            return Accepted("/api/webhooks/microsoft", new { accepted = true, action = "mailbox-sync", syncState.Id, syncState.Status, syncState.Message });
-        }
+        QueueWebhookProcessing(tenantId, MailProvider.Outlook, WebhookParsers.FromMicrosoftNotification(root), webhookEventId, mailbox?.Email);
+        return Ok(new { accepted = true, action = "queued-background-processing", webhookEventId });
+    }
 
-        var email = workflow.IngestWebhook(tenantId, MailProvider.Outlook, WebhookParsers.FromMicrosoftNotification(document.RootElement));
-        MarkWebhookProcessed(webhookEventId, $"Notificacion Microsoft persistida como correo: {email.Id}.");
-        return Accepted("/api/webhooks/microsoft", new { accepted = true, action = "stored-webhook-notification", email.Id });
+    private void QueueWebhookProcessing(Guid tenantId, MailProvider provider, WebhookEmailEnvelope envelope, Guid webhookEventId, string? mailboxEmail)
+    {
+        MarkWebhookProcessing(webhookEventId, $"Procesamiento {provider} iniciado en segundo plano.");
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var syncState = await mailboxes.SyncProviderFromWebhook(tenantId, provider, mailboxEmail, CancellationToken.None);
+                if (syncState is not null)
+                {
+                    if (syncState.FailureCount > 0)
+                    {
+                        MarkWebhookFailed(webhookEventId, $"Sync {provider} fallo de forma controlada: {syncState.Status}. {syncState.Message}");
+                        logger.LogWarning("Webhook {Provider} {WebhookEventId} sync failed safely: {Status} {Message}.", provider, webhookEventId, syncState.Status, syncState.Message);
+                    }
+                    else
+                    {
+                        MarkWebhookProcessed(webhookEventId, $"Sync {provider} ejecutado: {syncState.Status}. {syncState.Message}");
+                    }
+
+                    return;
+                }
+
+                var email = workflow.IngestWebhook(tenantId, provider, envelope);
+                MarkWebhookProcessed(webhookEventId, $"Notificacion {provider} persistida como correo: {email.Id}.");
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Webhook {Provider} {WebhookEventId} failed in background processing.", provider, webhookEventId);
+                MarkWebhookFailed(webhookEventId, $"Error controlado procesando {provider}: {ex.Message}");
+            }
+        });
+    }
+
+    private void MarkWebhookProcessing(Guid webhookEventId, string message)
+    {
+        store.Write(() =>
+        {
+            var index = store.MailWebhookEvents.FindIndex(e => e.Id == webhookEventId);
+            if (index >= 0)
+            {
+                store.MailWebhookEvents[index] = store.MailWebhookEvents[index] with
+                {
+                    Status = "Processing",
+                    Message = message
+                };
+            }
+        });
     }
 
     private void MarkWebhookProcessed(Guid webhookEventId, string message)
@@ -120,6 +156,23 @@ public sealed class WebhooksController(
                 store.MailWebhookEvents[index] = store.MailWebhookEvents[index] with
                 {
                     Status = "Processed",
+                    Message = message,
+                    ProcessedAt = DateTimeOffset.UtcNow
+                };
+            }
+        });
+    }
+
+    private void MarkWebhookFailed(Guid webhookEventId, string message)
+    {
+        store.Write(() =>
+        {
+            var index = store.MailWebhookEvents.FindIndex(e => e.Id == webhookEventId);
+            if (index >= 0)
+            {
+                store.MailWebhookEvents[index] = store.MailWebhookEvents[index] with
+                {
+                    Status = "Failed",
                     Message = message,
                     ProcessedAt = DateTimeOffset.UtcNow
                 };
