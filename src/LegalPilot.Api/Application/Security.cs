@@ -88,6 +88,21 @@ public sealed class TokenService(IConfiguration configuration, IWebHostEnvironme
 
     public static string RandomToken(int bytes = 32) => Base64Url(RandomNumberGenerator.GetBytes(bytes));
 
+    public static (string RawToken, RefreshTokenSession Session) BuildRefreshSession(UserAccount user, string? ipAddress)
+    {
+        var raw = RandomToken(48);
+        return (raw, new RefreshTokenSession(
+            Guid.NewGuid(),
+            user.TenantId,
+            user.Id,
+            Sha256(raw),
+            DateTimeOffset.UtcNow.AddDays(14),
+            DateTimeOffset.UtcNow,
+            ipAddress,
+            null,
+            null));
+    }
+
     public static string Sha256(string value)
     {
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(value));

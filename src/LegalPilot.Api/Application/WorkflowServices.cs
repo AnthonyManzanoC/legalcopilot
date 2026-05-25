@@ -31,6 +31,12 @@ public sealed class AuthService(LegalPilotStore store, PasswordHasher hasher, To
             throw new UnauthorizedAccessException("Credenciales invalidas.");
         }
 
+        var loginTenant = store.Read(() => store.Tenants.FirstOrDefault(t => t.Id == user.TenantId));
+        if (loginTenant is null || (!loginTenant.IsActive && !user.Roles.Contains(UserRole.SuperAdmin)))
+        {
+            throw new UnauthorizedAccessException("La suscripcion del estudio no esta activa.");
+        }
+
         var principal = new AuthPrincipal(user.Id, user.TenantId, user.Email, user.Roles);
         var token = tokens.Create(principal, TimeSpan.FromHours(10));
         var refresh = CreateRefreshSession(user, ipAddress);
@@ -73,6 +79,11 @@ public sealed class AuthService(LegalPilotStore store, PasswordHasher hasher, To
             var session = store.RefreshTokenSessions[index];
             var user = store.Users.FirstOrDefault(u => u.Id == session.UserId && u.TenantId == session.TenantId && u.IsActive)
                 ?? throw new UnauthorizedAccessException("Usuario inactivo o no encontrado.");
+            var tenant = store.Tenants.FirstOrDefault(t => t.Id == user.TenantId);
+            if (tenant is null || (!tenant.IsActive && !user.Roles.Contains(UserRole.SuperAdmin)))
+            {
+                throw new UnauthorizedAccessException("La suscripcion del estudio no esta activa.");
+            }
 
             store.RefreshTokenSessions[index] = session with
             {
@@ -203,17 +214,7 @@ public sealed class AuthService(LegalPilotStore store, PasswordHasher hasher, To
 
     private static (string RawToken, RefreshTokenSession Session) BuildRefreshSession(UserAccount user, string? ipAddress)
     {
-        var raw = TokenService.RandomToken(48);
-        return (raw, new RefreshTokenSession(
-            Guid.NewGuid(),
-            user.TenantId,
-            user.Id,
-            TokenService.Sha256(raw),
-            DateTimeOffset.UtcNow.AddDays(14),
-            DateTimeOffset.UtcNow,
-            ipAddress,
-            null,
-            null));
+        return TokenService.BuildRefreshSession(user, ipAddress);
     }
 
     private static void ValidatePassword(string password)
@@ -553,6 +554,7 @@ public sealed class LegalWorkflowService(
     EcuadorDeadlineEngine deadlineEngine,
     IConfiguration configuration,
     ExternalCalendarSyncService? externalCalendars = null,
+    OpenWaClient? openWa = null,
     ILogger<LegalWorkflowService>? logger = null)
 {
     public LegalEmail IngestManual(AuthPrincipal principal, ManualEmailRequest request)
@@ -1225,6 +1227,7 @@ public sealed class LegalWorkflowService(
                 !autoConfirmDerivedWork);
             CreateReminderSet(email.TenantId, calendarEvent, title, holidays);
             QueueExternalCalendarSync(calendarEvent, responsible);
+            QueueZeroTouchWhatsAppNotification(calendarEvent, email, responsible);
         }
     }
 
@@ -1392,6 +1395,184 @@ public sealed class LegalWorkflowService(
             }
         });
     }
+
+    private void QueueZeroTouchWhatsAppNotification(CalendarEvent calendarEvent, LegalEmail email, Guid actorUserId)
+    {
+        if (openWa is null ||
+            !calendarEvent.Confirmed ||
+            calendarEvent.Type == CalendarEventType.Deadline ||
+            !calendarEvent.CaseId.HasValue)
+        {
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await SendZeroTouchWhatsAppNotification(calendarEvent.Id, email.Id, actorUserId, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                logger?.LogError(ex, "Zero-touch WhatsApp notification failed for event {EventId}.", calendarEvent.Id);
+            }
+        });
+    }
+
+    private async Task SendZeroTouchWhatsAppNotification(Guid calendarEventId, Guid legalEmailId, Guid actorUserId, CancellationToken cancellationToken)
+    {
+        var context = store.Read(() =>
+        {
+            var eventItem = store.CalendarEvents.FirstOrDefault(e => e.Id == calendarEventId);
+            if (eventItem is null || !eventItem.CaseId.HasValue)
+            {
+                return null;
+            }
+
+            var tenant = store.Tenants.FirstOrDefault(t => t.Id == eventItem.TenantId && t.IsActive);
+            var legalCase = store.Cases.FirstOrDefault(c => c.Id == eventItem.CaseId.Value && c.TenantId == eventItem.TenantId);
+            var client = legalCase?.ClientId is { } clientId
+                ? store.Clients.FirstOrDefault(c => c.Id == clientId && c.TenantId == eventItem.TenantId)
+                : null;
+            var email = store.Emails.FirstOrDefault(e => e.Id == legalEmailId && e.TenantId == eventItem.TenantId);
+            return tenant is null || legalCase is null || client is null || email is null
+                ? null
+                : new ZeroTouchWhatsAppContext(tenant, legalCase, client, eventItem, email);
+        });
+
+        if (context is null || string.IsNullOrWhiteSpace(context.Client.Phone))
+        {
+            return;
+        }
+
+        var clientMessage = BuildZeroTouchClientMessage(context);
+        var studioMessage = BuildZeroTouchStudioMessage(context);
+        var duplicate = store.Read(() => store.WhatsAppMessages.Any(m =>
+            m.TenantId == context.Tenant.Id &&
+            m.ClientId == context.Client.Id &&
+            m.CaseId == context.LegalCase.Id &&
+            m.To.Equals(context.Client.Phone, StringComparison.OrdinalIgnoreCase) &&
+            m.Body == clientMessage &&
+            m.CreatedAt > DateTimeOffset.UtcNow.AddDays(-1)));
+
+        if (duplicate)
+        {
+            return;
+        }
+
+        var clientResult = await openWa!.SendMessageAsync(context.Client.Phone, clientMessage, cancellationToken);
+        OpenWaSendResult studioResult;
+        if (string.IsNullOrWhiteSpace(context.Tenant.WhatsAppNumber))
+        {
+            studioResult = new OpenWaSendResult(false, "TenantWhatsAppMissing", null);
+        }
+        else
+        {
+            studioResult = await openWa.SendMessageAsync(context.Tenant.WhatsAppNumber, studioMessage, cancellationToken);
+        }
+
+        store.Write(() =>
+        {
+            store.WhatsAppMessages.Insert(0, new WhatsAppMessage(
+                Guid.NewGuid(),
+                context.Tenant.Id,
+                context.Client.Id,
+                context.LegalCase.Id,
+                context.Client.Phone,
+                clientMessage,
+                true,
+                clientResult.Success ? "Sent" : clientResult.ProviderStatus,
+                DateTimeOffset.UtcNow,
+                clientResult.Success ? DateTimeOffset.UtcNow : null));
+
+            store.WhatsAppMessages.Insert(0, new WhatsAppMessage(
+                Guid.NewGuid(),
+                context.Tenant.Id,
+                context.Client.Id,
+                context.LegalCase.Id,
+                string.IsNullOrWhiteSpace(context.Tenant.WhatsAppNumber) ? "(sin WhatsApp estudio)" : context.Tenant.WhatsAppNumber,
+                studioMessage,
+                true,
+                studioResult.Success ? "Sent" : studioResult.ProviderStatus,
+                DateTimeOffset.UtcNow,
+                studioResult.Success ? DateTimeOffset.UtcNow : null));
+
+            store.ChatMessages.Insert(0, new ChatMessage(
+                Guid.NewGuid(),
+                context.Tenant.Id,
+                context.Client.Id,
+                context.LegalCase.Id,
+                ChatDirection.Outbound,
+                NotificationChannel.WhatsApp,
+                actorUserId,
+                "LegalPilot Zero-Touch",
+                clientMessage,
+                false,
+                clientResult.Success ? "Sent" : clientResult.ProviderStatus,
+                DateTimeOffset.UtcNow));
+
+            store.AuditEntries.Insert(0, new AuditEntry(
+                Guid.NewGuid(),
+                context.Tenant.Id,
+                actorUserId,
+                AuditAction.SendWhatsApp,
+                nameof(CalendarEvent),
+                context.EventItem.Id.ToString(),
+                clientResult.Success
+                    ? $"Zero-touch notifico al cliente {context.Client.FullName} y envio copia al estudio con estado {studioResult.ProviderStatus}."
+                    : $"Zero-touch intento notificar al cliente {context.Client.FullName}; OpenWA respondio {clientResult.ProviderStatus}.",
+                new Dictionary<string, string>
+                {
+                    ["clientPhone"] = context.Client.Phone,
+                    ["studioWhatsApp"] = context.Tenant.WhatsAppNumber,
+                    ["caseNumber"] = context.LegalCase.CaseNumber,
+                    ["eventStartsAt"] = context.EventItem.StartsAt.ToString("O")
+                },
+                DateTimeOffset.UtcNow));
+        });
+    }
+
+    private static string BuildZeroTouchClientMessage(ZeroTouchWhatsAppContext context)
+    {
+        var eventLabel = SpanishEventLabel(context.EventItem.Type);
+        var startsAt = FormatQuitoDateTime(context.EventItem.StartsAt);
+        var location = string.IsNullOrWhiteSpace(context.EventItem.Location)
+            ? string.Empty
+            : $" Lugar: {context.EventItem.Location}.";
+        return $"Hola {context.Client.FullName}, tiene una {eventLabel} programada para {startsAt} dentro del caso {context.LegalCase.CaseNumber}.{location} Su estudio juridico le mantendra informado.";
+    }
+
+    private static string BuildZeroTouchStudioMessage(ZeroTouchWhatsAppContext context)
+    {
+        var eventLabel = SpanishEventLabel(context.EventItem.Type);
+        var startsAt = FormatQuitoDateTime(context.EventItem.StartsAt);
+        return $"Se ha notificado a su cliente {context.Client.FullName} sobre la {eventLabel} del caso {context.LegalCase.CaseNumber}, programada para {startsAt}. Correo origen: {context.Email.Subject}.";
+    }
+
+    private static string SpanishEventLabel(CalendarEventType type)
+    {
+        return type switch
+        {
+            CalendarEventType.Hearing => "audiencia",
+            CalendarEventType.Diligence => "diligencia",
+            CalendarEventType.ExpertReview => "pericia",
+            CalendarEventType.Meeting => "reunion",
+            CalendarEventType.Task => "actividad",
+            _ => "audiencia"
+        };
+    }
+
+    private static string FormatQuitoDateTime(DateTimeOffset value)
+    {
+        return value.ToOffset(TimeSpan.FromHours(-5)).ToString("yyyy-MM-dd HH:mm");
+    }
+
+    private sealed record ZeroTouchWhatsAppContext(
+        Tenant Tenant,
+        LegalCase LegalCase,
+        ClientProfile Client,
+        CalendarEvent EventItem,
+        LegalEmail Email);
 
     private AuthPrincipal? ResolveAutomationPrincipal(Guid tenantId, Guid preferredUserId)
     {
@@ -1762,7 +1943,8 @@ public sealed class ReminderDispatcher(
             var client = legalCase?.ClientId is { } clientId
                 ? store.Clients.FirstOrDefault(c => c.Id == clientId && c.TenantId == eventItem.TenantId)
                 : null;
-            return (legalCase, client);
+            var tenant = store.Tenants.FirstOrDefault(t => t.Id == eventItem.TenantId && t.IsActive);
+            return (legalCase, client, tenant);
         });
 
         if (context.client is null || string.IsNullOrWhiteSpace(context.client.Phone))
@@ -1772,7 +1954,17 @@ public sealed class ReminderDispatcher(
         }
 
         var clientMessage = BuildClientReminderMessage(context.client, context.legalCase, eventItem, reminder);
+        var studioMessage = BuildStudioReminderMessage(context.client, context.legalCase, eventItem, reminder);
         var result = await openWa.SendMessageAsync(context.client.Phone, clientMessage, cancellationToken);
+        OpenWaSendResult studioResult;
+        if (string.IsNullOrWhiteSpace(context.tenant?.WhatsAppNumber))
+        {
+            studioResult = new OpenWaSendResult(false, "TenantWhatsAppMissing", null);
+        }
+        else
+        {
+            studioResult = await openWa.SendMessageAsync(context.tenant.WhatsAppNumber, studioMessage, cancellationToken);
+        }
         store.Write(() =>
         {
             store.WhatsAppMessages.Insert(0, new WhatsAppMessage(
@@ -1786,6 +1978,18 @@ public sealed class ReminderDispatcher(
                 result.Success ? "Sent" : result.ProviderStatus,
                 DateTimeOffset.UtcNow,
                 result.Success ? DateTimeOffset.UtcNow : null));
+
+            store.WhatsAppMessages.Insert(0, new WhatsAppMessage(
+                Guid.NewGuid(),
+                reminder.TenantId,
+                context.client.Id,
+                context.legalCase?.Id,
+                string.IsNullOrWhiteSpace(context.tenant?.WhatsAppNumber) ? "(sin WhatsApp estudio)" : context.tenant.WhatsAppNumber,
+                studioMessage,
+                true,
+                studioResult.Success ? "Sent" : studioResult.ProviderStatus,
+                DateTimeOffset.UtcNow,
+                studioResult.Success ? DateTimeOffset.UtcNow : null));
 
             store.ChatMessages.Insert(0, new ChatMessage(
                 Guid.NewGuid(),
@@ -1803,7 +2007,15 @@ public sealed class ReminderDispatcher(
 
             var index = store.Reminders.FindIndex(r => r.Id == reminder.Id);
             store.Reminders[index] = reminder with { Status = result.Success ? NotificationStatus.Sent : NotificationStatus.Failed };
-            store.Audit(reminder.TenantId, eventItem.ResponsibleUserId, AuditAction.SendWhatsApp, nameof(Reminder), reminder.Id.ToString(), result.Success ? "Recordatorio WhatsApp enviado." : $"Recordatorio WhatsApp fallo: {result.ProviderStatus}.");
+            store.Audit(
+                reminder.TenantId,
+                eventItem.ResponsibleUserId,
+                AuditAction.SendWhatsApp,
+                nameof(Reminder),
+                reminder.Id.ToString(),
+                result.Success
+                    ? $"Recordatorio WhatsApp enviado al cliente; copia al estudio: {studioResult.ProviderStatus}."
+                    : $"Recordatorio WhatsApp fallo: {result.ProviderStatus}. Copia al estudio: {studioResult.ProviderStatus}.");
         });
     }
 
@@ -1825,6 +2037,12 @@ public sealed class ReminderDispatcher(
     {
         var caseText = legalCase is null ? "su caso" : $"el caso {legalCase.CaseNumber}";
         return $"Estimado/a {client.FullName}, le recordamos {caseText}: {eventItem.Type} programado para {eventItem.StartsAt:yyyy-MM-dd HH:mm}. {reminder.Message}. Si necesita asesoria juridica, un abogado del estudio le contactara.";
+    }
+
+    private static string BuildStudioReminderMessage(ClientProfile client, LegalCase? legalCase, CalendarEvent eventItem, Reminder reminder)
+    {
+        var caseText = legalCase is null ? "sin caso asociado" : $"caso {legalCase.CaseNumber}";
+        return $"Se ha notificado a su cliente {client.FullName} sobre {eventItem.Type} ({caseText}) programado para {eventItem.StartsAt:yyyy-MM-dd HH:mm}. Resumen: {reminder.Message}.";
     }
 }
 

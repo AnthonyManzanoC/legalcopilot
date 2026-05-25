@@ -233,7 +233,7 @@ app.MapGet("/api/me", (HttpRequest request, TokenService tokens, LegalPilotStore
             user.TenantId,
             user.MfaEnabled
         },
-        tenant = new { tenant.Id, tenant.Name }
+        tenant = new { tenant.Id, tenant.Name, tenant.WhatsAppNumber, tenant.IsActive }
     });
 });
 
@@ -791,6 +791,7 @@ static class LegalPilotEnvironmentVariables
         ["LEGALPILOT_BOOTSTRAP_ADMIN_EMAIL"] = "LegalPilot:Bootstrap:AdminEmail",
         ["LEGALPILOT_BOOTSTRAP_ADMIN_PASSWORD"] = "LegalPilot:Bootstrap:AdminPassword",
         ["LEGALPILOT_BOOTSTRAP_LAWYER_PASSWORD"] = "LegalPilot:Bootstrap:LawyerPassword",
+        ["LEGALPILOT_SUPERADMIN_EMAIL"] = "LegalPilot:SuperAdmin:Email",
         ["LEGALPILOT_STORAGE_PATH"] = "LegalPilot:Storage:Path",
         ["LEGALPILOT_STORAGE_REQUIRE_POSTGRES"] = "LegalPilot:Storage:RequirePostgres",
         ["LEGALPILOT_MIGRATE_LOCAL_JSON"] = "LegalPilot:Storage:MigrateLocalJson",
@@ -975,6 +976,7 @@ static class OpenApiContract
         {
             ["/health"] = Path("get", "Health publico del backend"),
             ["/api/auth/login"] = Path("post", "Login con access token y refresh token rotativo"),
+            ["/api/auth/register-studio"] = Path("post", "Onboarding multi-tenant de estudio juridico"),
             ["/api/auth/refresh"] = Path("post", "Rotacion de refresh token"),
             ["/api/auth/logout"] = Path("post", "Revocacion de sesion"),
             ["/api/auth/forgot-password"] = Path("post", "Inicio de recuperacion de contrasena"),
@@ -1011,6 +1013,8 @@ static class OpenApiContract
             ["/api/ai/dataset.jsonl"] = Path("get", "Exportar dataset JSONL para entrenamiento/fine-tuning ligero"),
             ["/api/audit"] = Path("get", "Bitacora auditada"),
             ["/api/status"] = Path("get", "Diagnostico operativo autenticado"),
+            ["/api/superadmin/tenants"] = Path("get", "Dashboard SuperAdmin de tenants registrados"),
+            ["/api/superadmin/tenants/{id}/subscription"] = Path("patch", "Bloquear o activar suscripcion de tenant"),
             ["/api/webhooks/gmail"] = Path("post", "Webhook Gmail Pub/Sub"),
             ["/api/webhooks/microsoft"] = Path("get", "Validacion Graph", "post", "Webhook Microsoft Graph"),
             ["/api/webhooks/openwa"] = Path("post", "Webhook OpenWA")

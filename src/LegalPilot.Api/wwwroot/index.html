@@ -29,6 +29,7 @@
         <button class="nav" data-view="alerts">Alertas</button>
         <button class="nav" data-view="integrations">Integraciones</button>
         <button class="nav" data-view="reports">Reportes</button>
+        <button class="nav hidden" data-view="superadmin" data-superadmin-only>Super Admin</button>
         <button class="nav" data-view="system">Estado</button>
         <button class="nav" data-view="settings">Configuracion</button>
         <button class="nav" data-view="audit">Auditoria</button>
@@ -49,46 +50,102 @@
       </header>
 
       <section id="loginPanel" class="login-panel">
-        <form id="loginForm" class="login-box">
-          <div>
-            <p class="eyebrow">Acceso seguro</p>
-            <h2>Entrar a LegalPilot</h2>
+        <aside class="auth-hero">
+          <div class="auth-brand">
+            <div class="mark">LP</div>
+            <div>
+              <strong>LegalPilot</strong>
+              <span>Ecuador</span>
+            </div>
           </div>
-          <label>
-            Correo
-            <input name="email" type="email" placeholder="abogado@estudio.ec" autocomplete="username" autocapitalize="none" spellcheck="false" required>
-          </label>
-          <label>
-            Contrasena
-            <input name="password" type="password" autocomplete="current-password" required>
-          </label>
-          <button type="submit">Entrar</button>
-          <button type="button" class="ghost inline" id="forgotToggle">Recuperar contrasena</button>
-          <p id="loginError" class="error"></p>
-        </form>
+          <div class="auth-copy">
+            <p class="eyebrow">SaaS juridico B2B</p>
+            <h2>Operacion legal multi-tenant con automatizacion zero-touch.</h2>
+            <p>Registra tu estudio, conecta correo/calendario y separa cada cliente, caso y notificacion por tenant.</p>
+          </div>
+          <div class="auth-proof">
+            <span>Tenant aislado</span>
+            <span>OpenWA</span>
+            <span>Google / Microsoft</span>
+          </div>
+        </aside>
 
-        <form id="forgotForm" class="login-box hidden">
-          <div>
-            <p class="eyebrow">Recuperacion</p>
-            <h2>Restablecer acceso</h2>
+        <div class="auth-card">
+          <div class="auth-tabs" role="tablist" aria-label="Acceso LegalPilot">
+            <button type="button" class="auth-tab active" data-auth-view="login">Iniciar Sesion</button>
+            <button type="button" class="auth-tab" data-auth-view="register">Registrar mi Estudio Juridico</button>
           </div>
-          <label>
-            Correo
-            <input name="email" type="email" placeholder="abogado@estudio.ec" autocomplete="username" required>
-          </label>
-          <button type="submit">Generar token</button>
-          <label>
-            Token
-            <input name="token" autocomplete="one-time-code">
-          </label>
-          <label>
-            Nueva contrasena
-            <input name="newPassword" type="password" minlength="10" autocomplete="new-password">
-          </label>
-          <button type="button" id="resetPasswordBtn">Actualizar contrasena</button>
-          <button type="button" class="ghost inline" id="backToLogin">Volver al login</button>
-          <p id="forgotMessage" class="muted"></p>
-        </form>
+
+          <form id="loginForm" class="auth-form" data-auth-panel="login">
+            <div>
+              <p class="eyebrow">Acceso seguro</p>
+              <h2>Entrar a mi estudio</h2>
+            </div>
+            <label>
+              Correo
+              <input name="email" type="email" placeholder="abogado@estudio.ec" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+            </label>
+            <label>
+              Contrasena
+              <input name="password" type="password" autocomplete="current-password" required>
+            </label>
+            <button type="submit">Entrar al panel</button>
+            <button type="button" class="ghost inline" id="forgotToggle">Recuperar contrasena</button>
+            <p id="loginError" class="error"></p>
+          </form>
+
+          <form id="registerForm" class="auth-form hidden" data-auth-panel="register">
+            <div>
+              <p class="eyebrow">Onboarding multi-tenant</p>
+              <h2>Crear tenant del estudio</h2>
+            </div>
+            <label>
+              Nombre del Abogado
+              <input name="lawyerName" autocomplete="name" placeholder="Dra. Ana Morales" required>
+            </label>
+            <label>
+              Email
+              <input name="email" type="email" autocomplete="username" placeholder="admin@estudio.ec" autocapitalize="none" spellcheck="false" required>
+            </label>
+            <label>
+              Contrasena
+              <input name="password" type="password" autocomplete="new-password" minlength="10" required>
+            </label>
+            <label>
+              Nombre del Estudio Juridico
+              <input name="studioName" placeholder="Morales & Asociados" required>
+            </label>
+            <label>
+              Numero de WhatsApp del Estudio
+              <input name="studioWhatsApp" inputmode="tel" placeholder="+593999000111" pattern="^\+?593[0-9]{8,9}$" title="Use formato Ecuador: +593999000111" required>
+            </label>
+            <button type="submit">Registrar estudio</button>
+            <p id="registerMessage" class="muted"></p>
+          </form>
+
+          <form id="forgotForm" class="auth-form hidden">
+            <div>
+              <p class="eyebrow">Recuperacion</p>
+              <h2>Restablecer acceso</h2>
+            </div>
+            <label>
+              Correo
+              <input name="email" type="email" placeholder="abogado@estudio.ec" autocomplete="username" required>
+            </label>
+            <button type="submit">Generar token</button>
+            <label>
+              Token
+              <input name="token" autocomplete="one-time-code">
+            </label>
+            <label>
+              Nueva contrasena
+              <input name="newPassword" type="password" minlength="10" autocomplete="new-password">
+            </label>
+            <button type="button" id="resetPasswordBtn">Actualizar contrasena</button>
+            <button type="button" class="ghost inline" id="backToLogin">Volver al login</button>
+            <p id="forgotMessage" class="muted"></p>
+          </form>
+        </div>
 
         <aside id="publicStatus" class="login-status">
           <div class="status-row">
@@ -142,6 +199,20 @@
               </div>
               <div id="dashboardFocus" class="list"></div>
             </section>
+          </div>
+        </section>
+
+        <section id="superadmin" class="view">
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <p class="eyebrow">Control maestro</p>
+                <h2>Tenants registrados</h2>
+              </div>
+              <button class="compact" data-refresh="superadmin">Actualizar</button>
+            </div>
+            <div id="superadminMetrics" class="metrics compact-metrics"></div>
+            <div id="superadminTenants" class="tenant-table"></div>
           </div>
         </section>
 

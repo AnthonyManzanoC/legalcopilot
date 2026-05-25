@@ -74,6 +74,18 @@ public static partial class InputGuard
         return phone;
     }
 
+    public static string EcuadorWhatsApp(string? value, string fieldName = "WhatsApp")
+    {
+        var phone = Required(value, fieldName, 32);
+        var digits = new string(phone.Where(char.IsDigit).ToArray());
+        if (!EcuadorWhatsAppRegex().IsMatch(digits))
+        {
+            throw new ArgumentException($"{fieldName} debe usar formato Ecuador 593, por ejemplo +593999000111.");
+        }
+
+        return $"+{digits}";
+    }
+
     public static string CaseNumber(string? value)
     {
         var caseNumber = Required(value, "Numero de causa", 64);
@@ -148,6 +160,9 @@ public static partial class InputGuard
 
     [GeneratedRegex(@"^\+?[0-9 ()-]{7,32}$", RegexOptions.Compiled)]
     private static partial Regex PhoneRegex();
+
+    [GeneratedRegex(@"^593[0-9]{8,9}$", RegexOptions.Compiled)]
+    private static partial Regex EcuadorWhatsAppRegex();
 
     [GeneratedRegex(@"^[0-9A-Za-z.-]{5,64}$", RegexOptions.Compiled)]
     private static partial Regex CaseNumberRegex();

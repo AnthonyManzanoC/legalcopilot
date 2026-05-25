@@ -6,6 +6,7 @@ public sealed record Tenant(
     Guid Id,
     string Name,
     DateTimeOffset CreatedAt,
+    string WhatsAppNumber = "",
     bool IsActive = true);
 
 public sealed record UserAccount(
@@ -401,5 +402,8 @@ public sealed record AuthPrincipal(
     [JsonIgnore]
     public bool IsSuperAdmin => Roles.Contains(UserRole.SuperAdmin);
 
-    public bool HasAnyRole(params UserRole[] roles) => IsSuperAdmin || roles.Any(Roles.Contains);
+    public bool HasAnyRole(params UserRole[] roles) =>
+        IsSuperAdmin ||
+        roles.Any(Roles.Contains) ||
+        (Roles.Contains(UserRole.Admin) && roles.Contains(UserRole.Lawyer));
 }

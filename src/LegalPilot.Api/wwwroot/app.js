@@ -6,6 +6,7 @@ const state = {
   cases: [],
   clients: [],
   users: [],
+  superadminTenants: [],
   runtime: null
 };
 
@@ -41,6 +42,20 @@ const tagClass = (value) => {
   if (["alta", "failed", "configurationmissing", "providernotconfigured", "overdue", "cancelled"].some((item) => raw.includes(item))) return "high";
   if (["confirmed", "sent", "configured", "oauthready", "acknowledged", "stored"].some((item) => raw.includes(item))) return "ok";
   return "";
+};
+
+const isSuperAdmin = () => (state.user?.roles || state.user?.Roles || []).some((role) => String(role).toLowerCase() === "superadmin");
+
+const setAuthView = (view) => {
+  $$("[data-auth-view]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.authView === view);
+  });
+  $$("[data-auth-panel]").forEach((panel) => {
+    panel.classList.toggle("hidden", panel.dataset.authPanel !== view);
+  });
+  $("#forgotForm")?.classList.add("hidden");
+  $("#loginError").textContent = "";
+  $("#registerMessage").textContent = "";
 };
 
 const showToast = (message, kind = "ok") => {
@@ -184,6 +199,7 @@ const showApp = async () => {
     $("#loginPanel").classList.remove("hidden");
     $("#appPanel").classList.add("hidden");
     $(".sidebar").classList.add("hidden");
+    $$("[data-superadmin-only]").forEach((item) => item.classList.add("hidden"));
     $("#userBox").textContent = "Sin sesion";
     $("#systemChip").textContent = state.runtime?.storage?.provider === "postgresql" ? "PostgreSQL activo" : "Sin sesion";
     $("#systemChip").className = state.runtime?.storage?.provider === "postgresql" ? "status-chip ok" : "status-chip";
@@ -197,6 +213,7 @@ const showApp = async () => {
     $("#loginPanel").classList.add("hidden");
     $("#appPanel").classList.remove("hidden");
     $(".sidebar").classList.remove("hidden");
+    $$("[data-superadmin-only]").forEach((item) => item.classList.toggle("hidden", !isSuperAdmin()));
     $("#userBox").textContent = `${me.user.displayName} - ${me.tenant.name}`;
     $("#systemChip").textContent = "Conectado";
     $("#systemChip").className = "status-chip ok";
@@ -239,6 +256,7 @@ const refreshAll = async () => {
     loadAlerts(),
     loadIntegrations(),
     loadReports(),
+    isSuperAdmin() ? loadSuperAdmin() : Promise.resolve(),
     loadSystemStatus(),
     loadSettings(),
     loadAudit()
@@ -258,6 +276,7 @@ const refreshView = async (view) => {
     alerts: loadAlerts,
     integrations: loadIntegrations,
     reports: loadReports,
+    superadmin: loadSuperAdmin,
     system: loadSystemStatus,
     settings: loadSettings,
     audit: loadAudit
@@ -462,6 +481,71 @@ const loadReports = async () => {
     nextEvent ? itemTemplate("Proximo evento", formatDateTime(nextEvent.startsAt), nextEvent.title, nextEvent.confirmed ? "Confirmed" : "PendingReview") : "",
     latestEmail ? itemTemplate("Ultimo inbox", formatDateTime(latestEmail.receivedAt), latestEmail.subject, latestEmail.processingStatus) : ""
   ].filter(Boolean).join("");
+};
+
+const loadSuperAdmin = async () => {
+  if (!isSuperAdmin()) return;
+  const tenants = await api("/api/superadmin/tenants");
+  state.superadminTenants = tenants;
+  const active = tenants.filter((tenant) => tenant.isActive).length;
+  const cases = tenants.reduce((sum, tenant) => sum + (tenant.counts?.cases || 0), 0);
+  const clients = tenants.reduce((sum, tenant) => sum + (tenant.counts?.clients || 0), 0);
+  const connected = tenants.filter((tenant) => tenant.integrations?.google?.connected || tenant.integrations?.microsoft?.connected).length;
+
+  $("#superadminMetrics").innerHTML = [
+    ["Tenants", tenants.length],
+    ["Activos", active],
+    ["Casos", cases],
+    ["Clientes", clients],
+    ["Conectados", connected]
+  ].map(([label, value]) => `
+    <article class="metric">
+      <strong>${value}</strong>
+      <span>${escapeHtml(label)}</span>
+    </article>
+  `).join("");
+
+  $("#superadminTenants").innerHTML = tenants.length ? `
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Estudio</th>
+            <th>WhatsApp</th>
+            <th>Casos</th>
+            <th>Google</th>
+            <th>Microsoft</th>
+            <th>Estado</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          ${tenants.map((tenant) => {
+            const admin = tenant.admins?.[0];
+            const status = tenant.isActive ? "Activo" : "Bloqueado";
+            return `
+              <tr>
+                <td>
+                  <strong>${escapeHtml(tenant.name)}</strong>
+                  <span>${escapeHtml(admin?.email || "sin admin activo")}</span>
+                </td>
+                <td>${escapeHtml(tenant.whatsAppNumber || "-")}</td>
+                <td>${tenant.counts?.cases || 0}</td>
+                <td><span class="tag ${tagClass(tenant.integrations?.google?.status)}">${escapeHtml(tenant.integrations?.google?.status || "NotConnected")}</span></td>
+                <td><span class="tag ${tagClass(tenant.integrations?.microsoft?.status)}">${escapeHtml(tenant.integrations?.microsoft?.status || "NotConnected")}</span></td>
+                <td><span class="tag ${tenant.isActive ? "ok" : "high"}">${escapeHtml(status)}</span></td>
+                <td>
+                  <button class="compact ${tenant.isActive ? "ghost inline danger-action" : ""}" data-toggle-tenant="${tenant.id}" data-active="${tenant.isActive ? "false" : "true"}">
+                    ${tenant.isActive ? "Bloquear" : "Activar"}
+                  </button>
+                </td>
+              </tr>
+            `;
+          }).join("")}
+        </tbody>
+      </table>
+    </div>
+  ` : `<p class="muted">No hay tenants registrados.</p>`;
 };
 
 const loadSystemStatus = async () => {
@@ -686,6 +770,10 @@ const submitJson = async (event, path, payloadFactory, after) => {
   }
 };
 
+$$("[data-auth-view]").forEach((button) => {
+  button.addEventListener("click", () => setAuthView(button.dataset.authView));
+});
+
 $("#loginForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   $("#loginError").textContent = "";
@@ -709,14 +797,45 @@ $("#loginForm").addEventListener("submit", async (event) => {
   }
 });
 
+$("#registerForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const formElement = event.currentTarget;
+  const button = $("button[type='submit']", formElement);
+  $("#registerMessage").textContent = "";
+  setLoading(button, true);
+  try {
+    const result = await api("/api/auth/register-studio", {
+      method: "POST",
+      body: JSON.stringify({
+        lawyerName: form.get("lawyerName"),
+        email: form.get("email"),
+        password: form.get("password"),
+        studioName: form.get("studioName"),
+        studioWhatsApp: form.get("studioWhatsApp")
+      })
+    });
+    state.token = result.accessToken;
+    state.refreshToken = result.refreshToken;
+    localStorage.setItem("legalpilot.token", state.token);
+    localStorage.setItem("legalpilot.refresh", state.refreshToken);
+    $("#registerMessage").textContent = result.message || "Estudio registrado.";
+    showToast("Estudio registrado. Entrando al panel.");
+    await showApp();
+  } catch (error) {
+    $("#registerMessage").textContent = error.message;
+    showToast(error.message, "error");
+  } finally {
+    setLoading(button, false);
+  }
+});
+
 $("#forgotToggle").addEventListener("click", () => {
-  $("#loginForm").classList.add("hidden");
+  $$("[data-auth-panel]").forEach((panel) => panel.classList.add("hidden"));
   $("#forgotForm").classList.remove("hidden");
 });
 
 $("#backToLogin").addEventListener("click", () => {
-  $("#forgotForm").classList.add("hidden");
-  $("#loginForm").classList.remove("hidden");
+  setAuthView("login");
 });
 
 $("#forgotForm").addEventListener("submit", async (event) => {
@@ -936,6 +1055,7 @@ document.addEventListener("click", async (event) => {
   const disconnectMailbox = event.target.closest("[data-disconnect-mailbox]");
   const cancelEvent = event.target.closest("[data-cancel-event]");
   const connectProvider = event.target.closest("[data-connect-provider]");
+  const toggleTenant = event.target.closest("[data-toggle-tenant]");
 
   try {
     if (connectProvider) {
@@ -949,6 +1069,16 @@ document.addEventListener("click", async (event) => {
 
     if (oauthProvider) {
       await startOAuth(oauthProvider.dataset.oauthProvider, oauthProvider);
+      return;
+    }
+
+    if (toggleTenant) {
+      await api(`/api/superadmin/tenants/${toggleTenant.dataset.toggleTenant}/subscription`, {
+        method: "PATCH",
+        body: JSON.stringify({ isActive: toggleTenant.dataset.active === "true" })
+      });
+      await loadSuperAdmin();
+      showToast("Suscripcion actualizada.");
       return;
     }
 

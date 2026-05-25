@@ -359,6 +359,7 @@ public static class SeedData
         var adminPassword = FirstConfigured(
             Environment.GetEnvironmentVariable("LEGALPILOT_BOOTSTRAP_ADMIN_PASSWORD"),
             configuration?["LegalPilot:Bootstrap:AdminPassword"]);
+        var superAdminEmail = ResolveSuperAdminEmail(configuration) ?? adminEmail;
 
         if (string.IsNullOrWhiteSpace(adminEmail) || string.IsNullOrWhiteSpace(adminPassword))
         {
@@ -380,7 +381,8 @@ public static class SeedData
         var (adminHash, adminSalt) = hasher.HashPassword(adminPassword);
 
         store.Tenants.Add(new Tenant(tenantId, tenantName, now));
-        store.Users.Add(new UserAccount(adminId, tenantId, adminEmail, "Admin LegalPilot", adminHash, adminSalt, [UserRole.SuperAdmin, UserRole.Lawyer], false, now));
+        var adminRoles = BuildBootstrapRoles(adminEmail, superAdminEmail);
+        store.Users.Add(new UserAccount(adminId, tenantId, adminEmail, "Admin LegalPilot", adminHash, adminSalt, adminRoles, false, now));
 
         foreach (var holiday in EcuadorHolidaySeed.National2026(tenantId))
         {
@@ -419,6 +421,7 @@ public static class SeedData
         var adminPassword = FirstConfigured(
             Environment.GetEnvironmentVariable("LEGALPILOT_BOOTSTRAP_ADMIN_PASSWORD"),
             configuration?["LegalPilot:Bootstrap:AdminPassword"]);
+        var superAdminEmail = ResolveSuperAdminEmail(configuration) ?? adminEmail;
 
         if (string.IsNullOrWhiteSpace(adminEmail) || string.IsNullOrWhiteSpace(adminPassword))
         {
@@ -443,7 +446,7 @@ public static class SeedData
         var (adminHash, adminSalt) = hasher.HashPassword(adminPassword);
         if (store.PersistenceProvider == "postgresql")
         {
-            var admin = UpsertBootstrapAdminInMemory(store, tenant.Id, adminEmail, adminHash, adminSalt, now);
+            var admin = UpsertBootstrapAdminInMemory(store, tenant.Id, adminEmail, adminHash, adminSalt, now, superAdminEmail);
             var postgresPruned = RemoveKnownDemoRows(store, tenant.Id, adminEmail);
             RepairTenantReferences(store, tenant.Id, admin.Id);
             var audit = new AuditEntry(
@@ -466,7 +469,7 @@ public static class SeedData
         var demoRemoved = false;
         store.Write(() =>
         {
-            var admin = UpsertBootstrapAdminInMemory(store, tenant.Id, adminEmail, adminHash, adminSalt, now);
+            var admin = UpsertBootstrapAdminInMemory(store, tenant.Id, adminEmail, adminHash, adminSalt, now, superAdminEmail);
             demoRemoved = RemoveKnownDemoRows(store, tenant.Id, adminEmail);
             RepairTenantReferences(store, tenant.Id, admin.Id);
             store.AuditEntries.Insert(0, new AuditEntry(
@@ -484,9 +487,10 @@ public static class SeedData
         });
     }
 
-    private static UserAccount UpsertBootstrapAdminInMemory(LegalPilotStore store, Guid tenantId, string adminEmail, string adminHash, string adminSalt, DateTimeOffset now)
+    private static UserAccount UpsertBootstrapAdminInMemory(LegalPilotStore store, Guid tenantId, string adminEmail, string adminHash, string adminSalt, DateTimeOffset now, string? superAdminEmail)
     {
         var existingIndex = store.Users.FindIndex(u => u.Email.Equals(adminEmail, StringComparison.OrdinalIgnoreCase));
+        var roles = BuildBootstrapRoles(adminEmail, superAdminEmail);
         if (existingIndex >= 0)
         {
             var existing = store.Users[existingIndex];
@@ -495,9 +499,7 @@ public static class SeedData
                 TenantId = tenantId,
                 PasswordHash = adminHash,
                 PasswordSalt = adminSalt,
-                Roles = existing.Roles.Contains(UserRole.SuperAdmin)
-                    ? existing.Roles
-                    : existing.Roles.Append(UserRole.SuperAdmin).Append(UserRole.Lawyer).Distinct().ToArray(),
+                Roles = roles,
                 IsActive = true
             };
             store.Users[existingIndex] = updated;
@@ -511,11 +513,32 @@ public static class SeedData
             "Admin LegalPilot",
             adminHash,
             adminSalt,
-            [UserRole.SuperAdmin, UserRole.Lawyer],
+            roles,
             false,
             now);
         store.Users.Add(admin);
         return admin;
+    }
+
+    private static IReadOnlyList<UserRole> BuildBootstrapRoles(string adminEmail, string? superAdminEmail)
+    {
+        var roles = new List<UserRole> { UserRole.Admin, UserRole.Lawyer };
+        if (!string.IsNullOrWhiteSpace(superAdminEmail) &&
+            adminEmail.Equals(superAdminEmail, StringComparison.OrdinalIgnoreCase))
+        {
+            roles.Insert(0, UserRole.SuperAdmin);
+        }
+
+        return roles;
+    }
+
+    private static string? ResolveSuperAdminEmail(IConfiguration? configuration)
+    {
+        return FirstConfigured(
+            Environment.GetEnvironmentVariable("LEGALPILOT_SUPERADMIN_EMAIL"),
+            configuration?["LegalPilot:SuperAdmin:Email"],
+            Environment.GetEnvironmentVariable("LEGALPILOT_BOOTSTRAP_ADMIN_EMAIL"),
+            configuration?["LegalPilot:Bootstrap:AdminEmail"]);
     }
 
     private static void PersistPostgresBootstrap(IConfiguration? configuration, Tenant tenant, UserAccount admin, AuditEntry audit)

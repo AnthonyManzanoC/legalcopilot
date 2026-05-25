@@ -435,7 +435,7 @@ public sealed class PostgresLegalPilotPersistence : ILegalPilotPersistence, ILeg
         }
     }
 
-    private static PgRow Row(Tenant item) => new(item.Id, item.Id, item.CreatedAt, null, null, null, null, null, null, null, null, null, null, null, null, null, item.IsActive ? "Active" : "Inactive", null, item.Name);
+    private static PgRow Row(Tenant item) => new(item.Id, item.Id, item.CreatedAt, null, null, null, null, null, null, null, null, null, null, item.WhatsAppNumber, null, null, item.IsActive ? "Active" : "Inactive", null, item.Name);
 
     private static PgRow Row(UserAccount item) => new(item.Id, item.TenantId, item.CreatedAt, null, item.Id, null, null, null, null, null, null, item.Email, null, null, null, null, item.IsActive ? "Active" : "Inactive", null, item.DisplayName);
 

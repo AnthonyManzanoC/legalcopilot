@@ -3,6 +3,7 @@ namespace LegalPilot.Api.Domain;
 public enum UserRole
 {
     SuperAdmin,
+    Admin,
     Lawyer,
     Assistant,
     Client
