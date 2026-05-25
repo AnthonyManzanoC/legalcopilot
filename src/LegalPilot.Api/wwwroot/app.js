@@ -832,6 +832,7 @@ $("#loginForm").addEventListener("submit", async (event) => {
 $("#registerForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const formElement = event.currentTarget;
+  const form = new FormData(formElement);
   const button = $("button[type='submit']", formElement);
   $("#registerMessage").textContent = "";
   setLoading(button, true);
